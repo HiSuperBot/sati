@@ -4,11 +4,13 @@ import androidx.lifecycle.ViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-enum class ConversationPhase { Idle, Listening, Processing, Speaking, Error }
+enum class ConversationPhase { Idle, PreparingSpeech, Listening, Processing, Speaking, Error }
 
 enum class SpeechProblem {
-    PermissionDenied, PermissionSettings, RecognitionUnavailable, NoSpeech,
-    Network, RecognitionFailed, SpeechUnavailable, EnglishUnavailable, PlaybackFailed
+    PermissionDenied, PermissionSettings, RecognitionUnavailable, SpeechDownloadPending,
+    SpeechDownloadFailed, NoSpeech,
+    Network, RecognitionFailed, SpeechUnavailable, EnglishUnavailable, KoreanUnavailable,
+    PlaybackFailed, ModelUnavailable, GenerationFailed, InputTooLong
 }
 
 data class ConversationState(
@@ -16,10 +18,13 @@ data class ConversationState(
     val transcript: String = "",
     val reply: String = "",
     val problem: SpeechProblem? = null,
+    val isGenerating: Boolean = false,
 ) {
     val isActive: Boolean
-        get() = phase == ConversationPhase.Listening ||
-            phase == ConversationPhase.Processing || phase == ConversationPhase.Speaking
+        get() = phase in setOf(
+            ConversationPhase.PreparingSpeech, ConversationPhase.Listening,
+            ConversationPhase.Processing, ConversationPhase.Speaking,
+        )
 }
 
 data class ListeningCallbacks(
@@ -27,6 +32,7 @@ data class ListeningCallbacks(
     val onEnd: () -> Unit,
     val onResult: (String) -> Unit,
     val onError: (SpeechProblem) -> Unit,
+    val onPreparing: () -> Unit = {},
 )
 
 interface VoiceSession {
@@ -35,24 +41,37 @@ interface VoiceSession {
     fun cancel()
 }
 
+data class ReplyCallbacks(
+    val onPartial: (String) -> Unit,
+    val onComplete: (String) -> Unit,
+    val onError: () -> Unit,
+)
+
+interface ReplyGenerator {
+    val isReady: Boolean
+    fun generate(text: String, callbacks: ReplyCallbacks)
+    fun cancel()
+    fun reset()
+}
+
 class ConversationViewModel : ViewModel() {
     private val mutableState = MutableStateFlow(ConversationState())
     val state = mutableState.asStateFlow()
     private var generation = 0L
     private var session: VoiceSession? = null
+    private var generator: ReplyGenerator? = null
 
-    fun startConversation(voiceSession: VoiceSession) {
-        if (state.value.isActive) return
-        val turn = ++generation
-        session = voiceSession
-        mutableState.value = state.value.copy(
-            phase = ConversationPhase.Processing,
-            problem = null,
-        )
+    fun startConversation(voice: VoiceSession, replies: ReplyGenerator) {
+        val turn = beginTurn(voice, replies) ?: return
         var acceptedResult = false
         fun acceptsInput() = turn == generation && !acceptedResult && state.value.isActive
-        voiceSession.listen(
+        voice.listen(
             ListeningCallbacks(
+                onPreparing = {
+                    if (acceptsInput()) {
+                        mutableState.value = state.value.copy(phase = ConversationPhase.PreparingSpeech)
+                    }
+                },
                 onReady = {
                     if (acceptsInput()) {
                         mutableState.value = state.value.copy(phase = ConversationPhase.Listening)
@@ -66,24 +85,67 @@ class ConversationViewModel : ViewModel() {
                 onResult = { text ->
                     if (acceptsInput()) {
                         acceptedResult = true
-                        if (text.isBlank()) {
-                            fail(SpeechProblem.NoSpeech)
+                        generateReply(turn, text, voice, replies)
+                    }
+                },
+                onError = { problem -> if (acceptsInput()) fail(problem) },
+            ),
+        )
+    }
+
+    private fun beginTurn(voice: VoiceSession, replies: ReplyGenerator): Long? {
+        if (state.value.isActive) return null
+        if (!replies.isReady) {
+            fail(SpeechProblem.ModelUnavailable)
+            return null
+        }
+        val turn = ++generation
+        session = voice
+        generator = replies
+        mutableState.value = state.value.copy(phase = ConversationPhase.Processing, problem = null)
+        return turn
+    }
+
+    private fun generateReply(
+        turn: Long,
+        text: String,
+        voice: VoiceSession,
+        replies: ReplyGenerator,
+    ) {
+        val input = text.trim()
+        if (input.isEmpty()) return fail(SpeechProblem.NoSpeech)
+        if (input.length > MAX_INPUT_LENGTH) return fail(SpeechProblem.InputTooLong)
+        mutableState.value = state.value.copy(
+            phase = ConversationPhase.Processing,
+            transcript = input,
+            reply = "",
+            isGenerating = true,
+        )
+        fun acceptsReply() = turn == generation && state.value.isGenerating
+        replies.generate(
+            input,
+            ReplyCallbacks(
+                onPartial = { partial ->
+                    if (acceptsReply()) mutableState.value = state.value.copy(reply = partial)
+                },
+                onComplete = { response ->
+                    if (acceptsReply()) {
+                        val reply = response.trim()
+                        if (reply.isEmpty()) {
+                            fail(SpeechProblem.GenerationFailed)
                         } else {
                             mutableState.value = state.value.copy(
-                                phase = ConversationPhase.Speaking,
-                                transcript = text.trim(),
-                                reply = SCRIPTED_REPLY,
+                                phase = ConversationPhase.Speaking, reply = reply, isGenerating = false,
                             )
-                            voiceSession.speak(
-                                SCRIPTED_REPLY,
+                            voice.speak(
+                                reply,
                                 onDone = {
                                     if (turn == generation &&
                                         state.value.phase == ConversationPhase.Speaking
                                     ) {
                                         session = null
-                                        mutableState.value = state.value.copy(
-                                            phase = ConversationPhase.Idle,
-                                        )
+                                        generator = null
+                                        mutableState.value = state.value.copy(phase = ConversationPhase.Idle)
                                     }
                                 },
                                 onError = { problem ->
@@ -95,17 +157,26 @@ class ConversationViewModel : ViewModel() {
                         }
                     }
                 },
-                onError = { problem -> if (acceptsInput()) fail(problem) },
+                onError = { if (acceptsReply()) fail(SpeechProblem.GenerationFailed) },
             ),
         )
+    }
+
+    fun newConversation(replies: ReplyGenerator) {
+        invalidateSession()
+        replies.reset()
+        mutableState.value = ConversationState()
     }
 
     fun showProblem(problem: SpeechProblem) = fail(problem)
 
     fun cancelConversation() {
         if (!state.value.isActive) return
+        val reply = if (state.value.isGenerating) "" else state.value.reply
         invalidateSession()
-        mutableState.value = state.value.copy(phase = ConversationPhase.Idle, problem = null)
+        mutableState.value = state.value.copy(
+            phase = ConversationPhase.Idle, problem = null, isGenerating = false, reply = reply,
+        )
     }
 
     fun refreshMicrophonePermission(granted: Boolean) {
@@ -118,22 +189,26 @@ class ConversationViewModel : ViewModel() {
     }
 
     private fun fail(problem: SpeechProblem) {
+        val reply = if (state.value.isGenerating) "" else state.value.reply
         invalidateSession()
-        mutableState.value = state.value.copy(phase = ConversationPhase.Error, problem = problem)
+        mutableState.value = state.value.copy(
+            phase = ConversationPhase.Error, problem = problem, isGenerating = false, reply = reply,
+        )
     }
 
     private fun invalidateSession() {
         generation++
-        val previous = session
+        val previousSession = session
+        val previousGenerator = generator
         session = null
-        previous?.cancel()
+        generator = null
+        previousSession?.cancel()
+        previousGenerator?.cancel()
     }
 
-    override fun onCleared() {
-        invalidateSession()
-    }
+    override fun onCleared() = invalidateSession()
 
     companion object {
-        const val SCRIPTED_REPLY = "Hello! What's your name?"
+        const val MAX_INPUT_LENGTH = 240
     }
 }

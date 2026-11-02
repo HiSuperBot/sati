@@ -11,7 +11,7 @@ android {
 
     defaultConfig {
         applicationId = "com.superbot.sati"
-        minSdk = 24
+        minSdk = 26
         targetSdk = 37
         versionCode = 1
         versionName = "1.0"
@@ -37,6 +37,8 @@ android {
 }
 
 dependencies {
+    implementation(libs.google.litert.lm)
+    implementation(libs.google.genai.prompt)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)

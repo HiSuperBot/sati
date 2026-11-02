@@ -24,6 +24,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.superbot.sati.ai.OfflineAiViewModel
 import com.superbot.sati.conversation.ConversationViewModel
 import com.superbot.sati.conversation.SpeechProblem
 import com.superbot.sati.speech.AndroidVoiceSession
@@ -33,23 +34,27 @@ import com.superbot.sati.ui.theme.SatiTheme
 class MainActivity : ComponentActivity() {
     private lateinit var conversation: ConversationViewModel
     private lateinit var voice: AndroidVoiceSession
+    private lateinit var offlineAi: OfflineAiViewModel
     private var foreground = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         conversation = ViewModelProvider(this)[ConversationViewModel::class.java]
         voice = AndroidVoiceSession(this)
+        offlineAi = ViewModelProvider(this)[OfflineAiViewModel::class.java]
         enableEdgeToEdge()
         setContent {
             SatiTheme {
                 val state by conversation.state.collectAsStateWithLifecycle()
+                val model by offlineAi.state.collectAsStateWithLifecycle()
+                val nanoAvailability by offlineAi.nanoAvailability.collectAsStateWithLifecycle()
                 var showRationale by rememberSaveable { mutableStateOf(false) }
                 val microphonePermission = rememberLauncherForActivityResult(
                     ActivityResultContracts.RequestPermission(),
                 ) { granted ->
                     if (granted) {
                         conversation.refreshMicrophonePermission(true)
-                        if (foreground) conversation.startConversation(voice)
+                        if (foreground) conversation.startConversation(voice, offlineAi)
                     } else {
                         conversation.showProblem(
                             if (ActivityCompat.shouldShowRequestPermissionRationale(
@@ -64,13 +69,25 @@ class MainActivity : ComponentActivity() {
                     state = state,
                     onTalk = {
                         when {
-                            hasMicrophonePermission() -> conversation.startConversation(voice)
+                            hasMicrophonePermission() -> conversation.startConversation(voice, offlineAi)
                             ActivityCompat.shouldShowRequestPermissionRationale(
                                 this, Manifest.permission.RECORD_AUDIO,
                             ) -> showRationale = true
                             else -> microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
                         }
                     },
+                    model = model,
+                    nanoAvailability = nanoAvailability,
+                    onCheckNano = offlineAi::refreshNanoAvailability,
+                    onSelectModel = { selected ->
+                        if (selected != model.model) {
+                            conversation.newConversation(offlineAi)
+                            offlineAi.selectModel(selected)
+                        }
+                    },
+                    onCancelDownload = offlineAi::cancelDownload,
+                    onRetryModel = offlineAi::retrySetup,
+                    onNewConversation = { conversation.newConversation(offlineAi) },
                     onCancel = conversation::cancelConversation,
                     onOpenSettings = {
                         try {

@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -20,13 +21,22 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
@@ -41,6 +51,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.superbot.sati.R
+import com.superbot.sati.ai.AiModel
+import com.superbot.sati.ai.NanoAvailability
+import com.superbot.sati.ai.ModelProblem
+import com.superbot.sati.ai.ModelStatus
+import com.superbot.sati.ai.OfflineModelState
 import com.superbot.sati.conversation.ConversationPhase
 import com.superbot.sati.conversation.ConversationState
 import com.superbot.sati.conversation.SpeechProblem
@@ -52,10 +67,21 @@ fun ConversationScreen(
     onTalk: () -> Unit,
     onCancel: () -> Unit,
     onOpenSettings: () -> Unit,
+    model: OfflineModelState = OfflineModelState(status = ModelStatus.Missing),
+    onCancelDownload: () -> Unit = {},
+    onRetryModel: () -> Unit = {},
+    onNewConversation: () -> Unit = {},
+    nanoAvailability: NanoAvailability = NanoAvailability.Checking,
+    onSelectModel: (AiModel) -> Unit = {},
+    onCheckNano: () -> Unit = {},
 ) {
+    val ready = model.status == ModelStatus.Ready
+    var showModels by rememberSaveable { mutableStateOf(false) }
+
     Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
         Box(
-            modifier = Modifier.fillMaxSize().padding(padding),
+            modifier = Modifier.fillMaxSize().padding(padding)
+                .consumeWindowInsets(padding),
             contentAlignment = Alignment.TopCenter,
         ) {
             Column(
@@ -71,20 +97,22 @@ fun ConversationScreen(
                     style = MaterialTheme.typography.bodyLarge,
                 )
                 SatiEyes(state.phase)
+                OfflineModelCard(
+                    model, onCancelDownload, onRetryModel,
+                    canChangeModel = !state.isActive,
+                    onChangeModel = { showModels = true },
+                )
                 Text(
-                    text = stringResource(state.statusResource()),
+                    text = stringResource(
+                        if (ready || state.problem != null) state.statusResource()
+                        else R.string.offline_setup_required,
+                    ),
                     modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
                     style = MaterialTheme.typography.titleMedium,
                     textAlign = TextAlign.Center,
                     color = if (state.problem != null) MaterialTheme.colorScheme.error
                         else MaterialTheme.colorScheme.onSurface,
                 )
-                if (state.transcript.isNotEmpty()) {
-                    ConversationCard(stringResource(R.string.you_said), state.transcript)
-                }
-                if (state.reply.isNotEmpty()) {
-                    ConversationCard(stringResource(R.string.sati_says), state.reply)
-                }
                 val needsSettings = state.problem == SpeechProblem.PermissionSettings
                 Button(
                     onClick = when {
@@ -92,6 +120,7 @@ fun ConversationScreen(
                         needsSettings -> onOpenSettings
                         else -> onTalk
                     },
+                    enabled = state.isActive || ready,
                     modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp),
                     contentPadding = PaddingValues(16.dp),
                 ) {
@@ -105,11 +134,165 @@ fun ConversationScreen(
                         style = MaterialTheme.typography.titleLarge,
                     )
                 }
+                if (state.transcript.isNotEmpty()) {
+                    ConversationCard(stringResource(R.string.you_said), state.transcript)
+                }
+                if (state.reply.isNotEmpty()) {
+                    ConversationCard(stringResource(R.string.sati_says), state.reply)
+                }
+                TextButton(
+                    onClick = onNewConversation,
+                    enabled = ready && !state.isActive,
+                ) { Text(stringResource(R.string.start_over)) }
                 Text(
                     stringResource(R.string.turn_hint),
                     style = MaterialTheme.typography.bodyMedium,
                     textAlign = TextAlign.Center,
                 )
+                Text(
+                    stringResource(R.string.offline_privacy),
+                    style = MaterialTheme.typography.bodySmall,
+                    textAlign = TextAlign.Center,
+                )
+            }
+        }
+    }
+    if (showModels) {
+        ModelChooser(
+            selected = model.model,
+            nanoAvailability = nanoAvailability,
+            onSelect = {
+                showModels = false
+                onSelectModel(it)
+            },
+            onCheckNano = onCheckNano,
+            onDismiss = { showModels = false },
+        )
+    }
+}
+
+@Composable
+private fun ModelChooser(
+    selected: AiModel,
+    nanoAvailability: NanoAvailability,
+    onSelect: (AiModel) -> Unit,
+    onCheckNano: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.choose_model)) },
+        text = {
+            Column(
+                Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(stringResource(R.string.model_switch_hint))
+                AiModel.entries.forEach { choice ->
+                    OutlinedButton(
+                        onClick = { onSelect(choice) },
+                        enabled = choice != AiModel.GeminiNano || nanoAvailability.canSelect,
+                        modifier = Modifier.fillMaxWidth().testTag("model-choice-${choice.id}"),
+                    ) {
+                        Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                            Text(choice.displayName, style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                stringResource(when (choice) {
+                                    AiModel.Qwen -> R.string.qwen_description
+                                    AiModel.Gemma -> R.string.gemma_description
+                                    AiModel.GeminiNano -> nanoAvailability.descriptionResource()
+                                }),
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            if (choice == selected) Text(stringResource(R.string.selected_model))
+                        }
+                    }
+                }
+                TextButton(
+                    onClick = onCheckNano,
+                    enabled = nanoAvailability != NanoAvailability.Checking,
+                ) { Text(stringResource(R.string.check_nano)) }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.close)) }
+        },
+    )
+}
+
+private fun NanoAvailability.descriptionResource() = when (this) {
+    NanoAvailability.Checking -> R.string.nano_checking
+    NanoAvailability.Available -> R.string.nano_available
+    NanoAvailability.Downloadable -> R.string.nano_downloadable
+    NanoAvailability.Downloading -> R.string.nano_downloading
+    NanoAvailability.Unavailable -> R.string.nano_unavailable
+    NanoAvailability.CheckFailed -> R.string.nano_check_failed
+}
+
+@Composable
+private fun setupDescription(model: AiModel): String = stringResource(
+    when (model) {
+        AiModel.Qwen -> R.string.qwen_description
+        AiModel.Gemma -> R.string.gemma_description
+        AiModel.GeminiNano -> R.string.nano_downloadable
+    },
+)
+
+@Composable
+private fun OfflineModelCard(
+    state: OfflineModelState,
+    onCancelDownload: () -> Unit,
+    onRetry: () -> Unit,
+    canChangeModel: Boolean,
+    onChangeModel: () -> Unit,
+) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(state.model.displayName, style = MaterialTheme.typography.titleMedium)
+            TextButton(onClick = onChangeModel, enabled = canChangeModel) {
+                Text(stringResource(R.string.change_model))
+            }
+            Text(
+                stringResource(when (state.status) {
+                    ModelStatus.Ready -> R.string.offline_ready
+                    ModelStatus.Loading -> R.string.offline_loading
+                    ModelStatus.Downloading -> if (state.model == AiModel.GeminiNano)
+                        R.string.nano_downloading else R.string.offline_downloading
+                    else -> R.string.offline_missing
+                }, state.downloadPercent),
+                style = MaterialTheme.typography.titleSmall,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            )
+            when (state.status) {
+                ModelStatus.Downloading -> {
+                    Text(setupDescription(state.model))
+                    if (state.model == AiModel.GeminiNano) {
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                    } else {
+                        LinearProgressIndicator(
+                            progress = { state.downloadPercent / 100f },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    TextButton(onClick = onCancelDownload) {
+                        Text(stringResource(R.string.cancel_download))
+                    }
+                }
+                ModelStatus.Loading -> CircularProgressIndicator(Modifier.size(24.dp))
+                ModelStatus.Ready -> Unit
+                else -> {
+                    if (state.problem == null) Text(setupDescription(state.model))
+                    else Text(stringResource(when (state.problem) {
+                        ModelProblem.DownloadFailed -> R.string.model_download_failed
+                        ModelProblem.VerificationFailed -> R.string.model_verification_failed
+                        ModelProblem.DownloadCanceled -> R.string.model_download_canceled
+                        ModelProblem.LoadFailed -> R.string.model_load_failed
+                        ModelProblem.UnsupportedDevice -> R.string.model_device_unsupported
+                        ModelProblem.NanoUnavailable -> R.string.nano_unavailable
+                        null -> R.string.offline_setup
+                    }))
+                    TextButton(onClick = onRetry) { Text(stringResource(R.string.retry_setup)) }
+                }
             }
         }
     }
@@ -175,14 +358,21 @@ private fun ConversationState.statusResource(): Int = when (problem) {
     SpeechProblem.PermissionDenied -> R.string.error_permission
     SpeechProblem.PermissionSettings -> R.string.error_permission_settings
     SpeechProblem.RecognitionUnavailable -> R.string.error_recognition_unavailable
+    SpeechProblem.SpeechDownloadPending -> R.string.error_speech_download_pending
+    SpeechProblem.SpeechDownloadFailed -> R.string.error_speech_download_failed
     SpeechProblem.NoSpeech -> R.string.error_no_speech
     SpeechProblem.Network -> R.string.error_network
     SpeechProblem.RecognitionFailed -> R.string.error_recognition
     SpeechProblem.SpeechUnavailable -> R.string.error_speech_unavailable
     SpeechProblem.EnglishUnavailable -> R.string.error_english_unavailable
+    SpeechProblem.KoreanUnavailable -> R.string.error_korean_unavailable
     SpeechProblem.PlaybackFailed -> R.string.error_playback
+    SpeechProblem.ModelUnavailable -> R.string.error_model_unavailable
+    SpeechProblem.GenerationFailed -> R.string.error_generation
+    SpeechProblem.InputTooLong -> R.string.error_input_length
     null -> when (phase) {
         ConversationPhase.Idle -> R.string.status_idle
+        ConversationPhase.PreparingSpeech -> R.string.status_preparing_speech
         ConversationPhase.Listening -> R.string.status_listening
         ConversationPhase.Processing -> R.string.status_processing
         ConversationPhase.Speaking -> R.string.status_speaking
@@ -193,7 +383,5 @@ private fun ConversationState.statusResource(): Int = when (problem) {
 @Preview(showBackground = true)
 @Composable
 private fun ConversationPreview() {
-    SatiTheme {
-        ConversationScreen(ConversationState(), {}, {}, {})
-    }
+    SatiTheme { ConversationScreen(ConversationState(), {}, {}, {}) }
 }
