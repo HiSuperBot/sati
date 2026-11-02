@@ -1,3 +1,28 @@
 <resources>
     <string name="app_name">Sati</string>
+    <string name="introduction">Let’s practice English together!</string>
+    <string name="status_idle">Tap Talk and say something in English.</string>
+    <string name="status_listening">I’m listening…</string>
+    <string name="status_processing">One moment…</string>
+    <string name="status_speaking">Sati is speaking…</string>
+    <string name="talk">Talk</string>
+    <string name="cancel">Cancel</string>
+    <string name="try_again">Try again</string>
+    <string name="open_settings">Open settings</string>
+    <string name="continue_label">Continue</string>
+    <string name="not_now">Not now</string>
+    <string name="you_said">You said</string>
+    <string name="sati_says">Sati says</string>
+    <string name="turn_hint">Take turns: speak, listen, then tap Talk again.</string>
+    <string name="microphone_title">Let Sati hear you</string>
+    <string name="microphone_rationale">Sati needs microphone access to hear your English. You can choose Not now.</string>
+    <string name="error_permission">Microphone access is needed to hear you. Tap Try again when you’re ready.</string>
+    <string name="error_permission_settings">Microphone access is off. Ask a grown-up to enable it in app settings.</string>
+    <string name="error_recognition_unavailable">Speech recognition is unavailable. Ask a grown-up to check this device’s speech services, then try again.</string>
+    <string name="error_no_speech">I didn’t catch that. Tap Try again and say something in English.</string>
+    <string name="error_network">There was a connection problem. Check your connection and try again.</string>
+    <string name="error_recognition">I couldn’t hear you this time. Let’s try again.</string>
+    <string name="error_speech_unavailable">Sati’s voice isn’t ready. Ask a grown-up to check text-to-speech settings, then try again.</string>
+    <string name="error_english_unavailable">An English voice is missing. Ask a grown-up to install one in text-to-speech settings, then try again.</string>
+    <string name="error_playback">I couldn’t play my reply. Tap Try again for another turn.</string>
 </resources>
