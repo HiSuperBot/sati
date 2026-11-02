@@ -1,6 +1,7 @@
 package com.superbot.sati.conversation
 
 import androidx.lifecycle.ViewModel
+import com.superbot.sati.ai.ReplyFailure
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
@@ -19,6 +20,7 @@ data class ConversationState(
     val reply: String = "",
     val problem: SpeechProblem? = null,
     val isGenerating: Boolean = false,
+    val replyFailure: ReplyFailure? = null,
 ) {
     val isActive: Boolean
         get() = phase in setOf(
@@ -44,7 +46,7 @@ interface VoiceSession {
 data class ReplyCallbacks(
     val onPartial: (String) -> Unit,
     val onComplete: (String) -> Unit,
-    val onError: () -> Unit,
+    val onError: (ReplyFailure) -> Unit,
 )
 
 interface ReplyGenerator {
@@ -60,6 +62,12 @@ class ConversationViewModel : ViewModel() {
     private var generation = 0L
     private var session: VoiceSession? = null
     private var generator: ReplyGenerator? = null
+    private var backend: String? = null
+
+    fun bindBackend(identity: String, replies: ReplyGenerator) {
+        if (backend != null && backend != identity) newConversation(replies)
+        backend = identity
+    }
 
     fun startConversation(voice: VoiceSession, replies: ReplyGenerator) {
         val turn = beginTurn(voice, replies) ?: return
@@ -102,7 +110,9 @@ class ConversationViewModel : ViewModel() {
         val turn = ++generation
         session = voice
         generator = replies
-        mutableState.value = state.value.copy(phase = ConversationPhase.Processing, problem = null)
+        mutableState.value = state.value.copy(
+            phase = ConversationPhase.Processing, problem = null, replyFailure = null,
+        )
         return turn
     }
 
@@ -157,7 +167,7 @@ class ConversationViewModel : ViewModel() {
                         }
                     }
                 },
-                onError = { if (acceptsReply()) fail(SpeechProblem.GenerationFailed) },
+                onError = { if (acceptsReply()) failReply(it) },
             ),
         )
     }
@@ -168,6 +178,15 @@ class ConversationViewModel : ViewModel() {
         mutableState.value = ConversationState()
     }
 
+    private fun failReply(failure: ReplyFailure) {
+        val reply = if (state.value.isGenerating) "" else state.value.reply
+        invalidateSession()
+        mutableState.value = state.value.copy(
+            phase = ConversationPhase.Error, problem = null, replyFailure = failure,
+            isGenerating = false, reply = reply,
+        )
+    }
+
     fun showProblem(problem: SpeechProblem) = fail(problem)
 
     fun cancelConversation() {
@@ -175,7 +194,8 @@ class ConversationViewModel : ViewModel() {
         val reply = if (state.value.isGenerating) "" else state.value.reply
         invalidateSession()
         mutableState.value = state.value.copy(
-            phase = ConversationPhase.Idle, problem = null, isGenerating = false, reply = reply,
+            phase = ConversationPhase.Idle, problem = null, replyFailure = null,
+            isGenerating = false, reply = reply,
         )
     }
 
@@ -192,7 +212,8 @@ class ConversationViewModel : ViewModel() {
         val reply = if (state.value.isGenerating) "" else state.value.reply
         invalidateSession()
         mutableState.value = state.value.copy(
-            phase = ConversationPhase.Error, problem = problem, isGenerating = false, reply = reply,
+            phase = ConversationPhase.Error, problem = problem, replyFailure = null,
+            isGenerating = false, reply = reply,
         )
     }
 

@@ -1,5 +1,6 @@
 package com.superbot.sati.conversation
 
+import com.superbot.sati.ai.ReplyFailure
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -109,8 +110,8 @@ class ConversationViewModelTest {
     fun generationFailureClearsPartialReplyAndNeverSpeaksIt() {
         recognize("Hello")
         replies.callbacks.onPartial("unfinished")
-        replies.callbacks.onError()
-        assertEquals(SpeechProblem.GenerationFailed, model.state.value.problem)
+        replies.callbacks.onError(ReplyFailure.Generation)
+        assertEquals(ReplyFailure.Generation, model.state.value.replyFailure)
         assertEquals("", model.state.value.reply)
         assertTrue(voice.spoken.isEmpty())
         recognize("Try again")
@@ -175,7 +176,7 @@ class ConversationViewModelTest {
         recognize("Second")
         old.onPartial("late")
         old.onComplete("late reply")
-        old.onError()
+        old.onError(ReplyFailure.Generation)
         assertEquals("Second", model.state.value.transcript)
         assertEquals("", model.state.value.reply)
         assertTrue(voice.spoken.isEmpty())
@@ -231,6 +232,42 @@ class ConversationViewModelTest {
         model.cancelConversation()
         assertEquals(ConversationPhase.Idle, model.state.value.phase)
         assertEquals(null, model.state.value.problem)
+    }
+
+    @Test
+    fun modelChangeClearsConversationButRotationAndCanceledSetupDoNot() {
+        model.bindBackend("qwen:0", replies)
+        recognize("Hello")
+        replies.callbacks.onComplete("Hi!")
+        voice.done()
+        model.bindBackend("qwen:0", replies)
+        assertEquals("Hi!", model.state.value.reply)
+        assertEquals(0, replies.resets)
+        model.bindBackend("deepseek:1", replies)
+        assertEquals(ConversationState(), model.state.value)
+        assertEquals(1, replies.resets)
+        recognize("Hello cloud")
+        replies.callbacks.onPartial("incomplete")
+        val old = replies.callbacks
+        model.bindBackend("deepseek:2", replies)
+        old.onComplete("late reply from the old key")
+        assertEquals(ConversationState(), model.state.value)
+        assertEquals(listOf("Hi!"), voice.spoken)
+    }
+
+    @Test
+    fun cloudFailureClearsPartialReplyAndANewTurnClearsTheError() {
+        recognize("Hello")
+        replies.callbacks.onPartial("unfinished")
+        replies.callbacks.onError(ReplyFailure.Authentication)
+        assertEquals(ReplyFailure.Authentication, model.state.value.replyFailure)
+        assertEquals(null, model.state.value.problem)
+        assertEquals("", model.state.value.reply)
+        assertTrue(voice.spoken.isEmpty())
+        recognize("Try again")
+        assertEquals(null, model.state.value.replyFailure)
+        replies.callbacks.onComplete("Hi!")
+        assertEquals(listOf("Hi!"), voice.spoken)
     }
 
     private class FakeReplies : ReplyGenerator {

@@ -16,14 +16,14 @@ class AiModelTest {
     @Test
     fun progressUsesSelectedModelSizeAndNanoHasNoInventedPercentage() {
         for (model in listOf(AiModel.Qwen, AiModel.Gemma)) {
-            assertEquals(50, OfflineModelState(
+            assertEquals(50, AiModelState(
                 model = model, downloadedBytes = model.downloadBytes / 2,
             ).downloadPercent)
-            assertEquals(100, OfflineModelState(
+            assertEquals(100, AiModelState(
                 model = model, downloadedBytes = model.downloadBytes * 2,
             ).downloadPercent)
         }
-        assertEquals(0, OfflineModelState(
+        assertEquals(0, AiModelState(
             model = AiModel.GeminiNano, downloadedBytes = Long.MAX_VALUE,
         ).downloadPercent)
     }

@@ -1,8 +1,9 @@
-# Voice-only offline conversation
+# Voice conversation with on-device and cloud models
 
-Sati uses on-device speech recognition, an on-device language model, and installed
-offline text-to-speech voices. There is no text-entry field, cloud inference API,
-or API key. Internet is used for model setup.
+Sati uses on-device speech recognition and installed offline text-to-speech
+voices. Chat is voice-only. Choose an on-device language model for offline
+replies, or explicitly select DeepSeek Flash for cloud replies. The only text
+entry is the DeepSeek API-key setup field.
 
 ## Choose a model
 
@@ -16,6 +17,7 @@ Only one LiteRT engine is loaded at a time.
 | Qwen3 0.6B | 613,722,264 bytes (614 MB) | LiteRT-LM CPU |
 | Gemma 4 E2B | 2,588,147,712 bytes (2.59 GB) | LiteRT-LM CPU |
 | Gemini Nano | Managed by Android AICore | ML Kit Prompt API |
+| DeepSeek Flash | No model download; API key and internet required | DeepSeek cloud API |
 
 Gemma needs substantially more storage and memory. Compatibility and response
 quality must be checked on target hardware.
@@ -31,6 +33,43 @@ waits for **AVAILABLE**, and then enables conversation. Downloads have a bounded
 wait and can be canceled from Sati; AICore may continue its shared download.
 Nano inference is canceled when a turn ends or the app backgrounds. Its client is
 closed when the ViewModel is destroyed. There is no cloud fallback.
+
+## DeepSeek setup
+
+1. Tap **Change model**, then **DeepSeek Flash**.
+2. Paste your own DeepSeek API key in the masked field and tap **Connect**.
+   Keys come from [DeepSeek Platform](https://platform.deepseek.com); API charges apply.
+3. Sati validates the key using `GET https://api.deepseek.com/models` and confirms
+   `deepseek-flash` is available. Setup never sends a paid chat completion.
+4. After successful validation and secure storage, DeepSeek becomes selected.
+   Tap **Talk** to begin. A saved key is reused after restarting the app.
+5. Use **Change API key** to replace it, or **Remove API key** to delete it.
+   Removing the key disables DeepSeek voice turns until setup succeeds.
+
+Canceling setup or entering an invalid key preserves the previous model and
+conversation. Failed replacements preserve the previous saved key. An unsaved
+draft stays in ViewModel memory across rotation, is cleared when dismissed or
+backgrounded, and never enters saved instance state. Validation is canceled on
+rotation and can be retried.
+
+The key is encrypted with AES-256-GCM using a non-exportable Android Keystore
+key. Each save uses a fresh IV and an atomic write in
+`noBackupFilesDir/credentials/deepseek.key`. Keys and ciphertext are excluded
+from backups. Uninstalling Sati removes its credential. Missing Keystore keys or
+corrupt ciphertext require reentry; diagnostics never contain the key.
+
+DeepSeek receives recognized speech text, Sati’s system instructions, and the
+bounded conversation history. Raw audio stays on-device. Only `delta.content`
+is displayed; reasoning fields are ignored. TTS starts after a successful
+complete stream, so truncated, failed, or canceled replies are never spoken.
+
+Authentication, insufficient balance, rate limit, network, and service failures
+have distinct messages. Authentication failure requires key setup again.
+Generation requests are not retried automatically and have a 90-second total
+timeout. Redirects are disabled. Cancel, backgrounding, model changes, and key
+removal cancel network calls and ignore late callbacks. Local models never
+send conversation text to DeepSeek, and cloud failures never silently switch
+the selected model.
 
 ## First launch and speech setup
 
@@ -72,10 +111,13 @@ Both downloadable LiteRT models are pinned to immutable revisions:
 The downloader issues HTTPS GETs for catalogue models and approved Hugging Face
 CDNs. Redirects to other domains, cleartext HTTP, credentials, and unexpected
 ports are rejected. No conversation text, audio, or identifiers are passed to
-the downloader. There are no cloud inference clients.
+the downloader. DeepSeek uses a separate HTTPS client only when explicitly
+selected or when the user submits a key for validation.
 
 Android grants INTERNET permission app-wide. Application code restricts its
-network client to model downloads. AICore separately manages Nano assets and
+download client to model downloads. The DeepSeek client uses only the fixed
+`https://api.deepseek.com/` endpoint for key validation and selected cloud chat.
+AICore separately manages Nano assets and
 availability/configuration checks; Android’s on-device recognition service
 manages English speech-model downloads.
 
@@ -92,7 +134,8 @@ It is not required to install or run the APK.
 
 Initialization, inference, cancellation, and release of LiteRT objects use one
 background owner thread. History stays in RAM, survives rotation, and clears on
-**Start over**, model switch, or process termination. Both backends receive the
+**Start over**, model switch, key replacement/removal, or process termination.
+All reply backends receive the
 first two and four latest completed turns. Canceled replies are not remembered.
 Input is limited to 240 characters and output to 128 tokens.
 
@@ -110,6 +153,9 @@ rather than silently changing the selected model.
 5. Cancel, rotate, and background during recording, generation, and playback.
 6. Switch between downloaded models offline; verify history resets.
 7. Check Nano availability and use it on a supported physical device.
+8. Select DeepSeek and connect with a key entered only in the app. Verify a
+   spoken reply, name recall, restart with the saved key, key replacement/removal,
+   loss of connectivity, and cancellation. Never put real keys in tests or logs.
 
 Development checks (use Android Studio or a terminal configured with its JDK):
 
@@ -124,7 +170,9 @@ app-private model files; allow setup to complete again afterward.
 Tests cover voice-only controls, speech setup cancellation, model selection,
 Nano availability gating, model-specific progress, bounded history, stale
 callbacks, integrity checks, resuming downloads, separate model caches, offline
-reuse, and network policy.
+reuse, and network policy. DeepSeek tests use MockWebServer and test-only keys
+for validation, payloads, streaming, cancellation, errors, and redirect rejection.
+Credential tests verify encrypted persistence, fresh IVs, removal, and corruption.
 
 References:
 [LiteRT-LM Android](https://developers.google.com/edge/litert-lm/android),

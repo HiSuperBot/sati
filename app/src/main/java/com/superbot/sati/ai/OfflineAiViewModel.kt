@@ -39,10 +39,10 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 
-enum class ModelStatus { Missing, Downloading, Loading, Ready, Failed }
-enum class ModelProblem { DownloadFailed, VerificationFailed, DownloadCanceled, LoadFailed, UnsupportedDevice, NanoUnavailable }
+enum class ModelStatus { Missing, Downloading, Loading, Ready, Failed, NeedsApiKey }
+enum class ModelProblem { DownloadFailed, VerificationFailed, DownloadCanceled, LoadFailed, UnsupportedDevice, NanoUnavailable, CredentialStorage }
 
-data class OfflineModelState(
+data class AiModelState(
     val status: ModelStatus = ModelStatus.Loading,
     val problem: ModelProblem? = null,
     val downloadedBytes: Long = 0,
@@ -54,18 +54,53 @@ data class OfflineModelState(
             (downloadedBytes * 100 / model.downloadBytes).toInt().coerceIn(0, 100) else 0
 }
 
-/** Native inference stays on one owner thread. Only model setup may use the network. */
-class OfflineAiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerator {
+/** Local runtimes stay on one owner thread; only the selected cloud backend sends chat requests. */
+class AiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerator {
     private val dispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
     private val mutex = Mutex()
     private val main = Handler(Looper.getMainLooper())
+    private val keyScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val deepSeek = DeepSeekClient()
+    private val keys = DeepSeekKeySetup(
+        keyScope, AndroidApiKeyStore(app), deepSeek,
+        onConnected = { activateModel(AiModel.DeepSeek, force = true) },
+    )
+    val keySetup = keys.state
+    val keyStatus = keys.status
+
+    fun openKeySetup() = keys.open()
+    fun editApiKey(draft: String) = keys.edit(draft.take(4097))
+    fun connectApiKey() = keys.connect()
+    fun dismissKeySetup() = keys.dismiss()
+    fun pauseKeyValidation() = keys.pauseValidation()
+
+    fun removeApiKey() {
+        if (disposed.get()) return
+        cancel()
+        keys.dismiss()
+        if (state.value.model == AiModel.DeepSeek) {
+            setupRequest.incrementAndGet()
+            setupJob?.cancel()
+            memory.clear()
+            mutableState.value = state.value.copy(status = ModelStatus.NeedsApiKey, problem = null)
+        }
+        keyScope.launch {
+            try {
+                keys.remove()
+            } catch (_: CancellationException) {
+                // ViewModel disposal.
+            } catch (_: Exception) {
+                if (state.value.model == AiModel.DeepSeek) modelFailed(ModelProblem.CredentialStorage)
+            }
+        }
+    }
     private val requestId = AtomicLong()
     private val setupRequest = AtomicLong()
     private val disposed = AtomicBoolean()
     private val directory = File(app.noBackupFilesDir, "models")
     private val preferences = app.getSharedPreferences("offline_models", Application.MODE_PRIVATE)
-    private val mutableState = MutableStateFlow(OfflineModelState(
+    private val mutableState = MutableStateFlow(AiModelState(
         model = AiModel.fromId(preferences.getString("selected_model", null)),
     ))
     private val mutableNanoAvailability = MutableStateFlow(NanoAvailability.Checking)
@@ -107,13 +142,23 @@ class OfflineAiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerat
     }
 
     fun selectModel(model: AiModel) {
-        if (disposed.get() || model == state.value.model) return
+        if (disposed.get()) return
+        if (model == AiModel.DeepSeek && !keyStatus.value.hasKey) {
+            keys.open()
+            return
+        }
+        keys.dismiss()
+        activateModel(model)
+    }
+
+    private fun activateModel(model: AiModel, force: Boolean = false) {
+        if (disposed.get() || (!force && model == state.value.model)) return
         if (model == AiModel.GeminiNano && !nanoAvailability.value.canSelect) return
         cancel()
         setupJob?.cancel()
         memory.clear()
         preferences.edit().putString("selected_model", model.id).apply()
-        mutableState.value = OfflineModelState(model = model)
+        mutableState.value = AiModelState(model = model)
         beginSetup()
     }
 
@@ -135,11 +180,22 @@ class OfflineAiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerat
     private fun beginSetup() {
         val setup = setupRequest.incrementAndGet()
         val selected = state.value.model
-        mutableState.value = OfflineModelState(status = ModelStatus.Loading, model = selected)
+        mutableState.value = AiModelState(status = ModelStatus.Loading, model = selected)
         setupJob = scope.launch {
             mutex.withLock {
                 stopGeneration()
                 try {
+                    if (selected == AiModel.DeepSeek) {
+                        releaseEngine()
+                        keys.awaitLoaded()
+                        currentCoroutineContext().ensureActive()
+                        if (setup != setupRequest.get()) return@withLock
+                        mutableState.value = state.value.copy(
+                            status = if (keys.key() != null) ModelStatus.Ready else ModelStatus.NeedsApiKey,
+                            problem = null,
+                        )
+                        return@withLock
+                    }
                     if (selected == AiModel.GeminiNano) {
                         prepareNano(setup)
                         return@withLock
@@ -152,7 +208,7 @@ class OfflineAiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerat
                             checkCanceled = { context.ensureActive() },
                             onProgress = { bytes ->
                                 if (!disposed.get() && setup == setupRequest.get()) {
-                                    mutableState.value = OfflineModelState(
+                                    mutableState.value = AiModelState(
                                         status = ModelStatus.Downloading, downloadedBytes = bytes,
                                         model = selected,
                                     )
@@ -200,14 +256,14 @@ class OfflineAiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerat
         check(client.availability() == NanoAvailability.Available)
         mutableNanoAvailability.value = NanoAvailability.Available
         memory.clear()
-        mutableState.value = OfflineModelState(
+        mutableState.value = AiModelState(
             status = ModelStatus.Ready, model = AiModel.GeminiNano,
         )
     }
 
     private suspend fun load(file: File, selected: AiModel) {
         currentCoroutineContext().ensureActive()
-        mutableState.value = OfflineModelState(status = ModelStatus.Loading, model = selected)
+        mutableState.value = AiModelState(status = ModelStatus.Loading, model = selected)
         releaseEngine()
         try {
             val config = EngineConfig(
@@ -219,7 +275,7 @@ class OfflineAiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerat
             engine = Engine(config).also { it.initialize() }
             currentCoroutineContext().ensureActive()
             memory.clear()
-            mutableState.value = OfflineModelState(status = ModelStatus.Ready, model = selected)
+            mutableState.value = AiModelState(status = ModelStatus.Ready, model = selected)
         } catch (canceled: CancellationException) {
             releaseEngine()
             throw canceled
@@ -240,11 +296,11 @@ class OfflineAiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerat
                     stopGeneration()
                     if (disposed.get() || request != requestId.get()) return@launch
                     if (!isReady) {
-                        deliver(request, callbacks.onError)
+                        deliver(request) { callbacks.onError(ReplyFailure.Generation) }
                         return@launch
                     }
                     generating = true
-                    if (state.value.model == AiModel.GeminiNano) return@withLock
+                    if (state.value.model == AiModel.GeminiNano || state.value.model.isCloud) return@withLock
                     releaseConversation()
                     val history = memory.snapshot().flatMap {
                         listOf(Message.user(it.user), Message.model(it.reply))
@@ -261,7 +317,14 @@ class OfflineAiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerat
                 }
                 val response = StringBuilder()
                 withTimeout(90_000L) {
-                    if (state.value.model == AiModel.GeminiNano) {
+                    if (state.value.model == AiModel.DeepSeek) {
+                        val key = keys.key() ?: throw ReplyException(ReplyFailure.Authentication)
+                        deepSeek.stream(key, text, memory.snapshot()).collect { delta ->
+                            response.append(delta)
+                            val partial = response.toString()
+                            deliver(request) { callbacks.onPartial(partial) }
+                        }
+                    } else if (state.value.model == AiModel.GeminiNano) {
                         val reply = nanoClient().generate(text, memory.snapshot()) { partial ->
                             deliver(request) { callbacks.onPartial(partial) }
                         }
@@ -282,18 +345,27 @@ class OfflineAiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerat
                         callbacks.onComplete(reply)
                     }
                 } else if (request == requestId.get()) {
-                    deliver(request, callbacks.onError)
+                    deliver(request) { callbacks.onError(ReplyFailure.Generation) }
                 }
             } catch (_: TimeoutCancellationException) {
                 runCatching { conversation?.cancelProcess() }
-                deliver(request, callbacks.onError)
+                deliver(request) { callbacks.onError(
+                    if (state.value.model.isCloud) ReplyFailure.Network else ReplyFailure.Generation,
+                ) }
             } catch (canceled: CancellationException) {
                 throw canceled
+            } catch (failure: ReplyException) {
+                if (request == requestId.get()) {
+                    if (failure.failure == ReplyFailure.Authentication) {
+                        mutableState.value = state.value.copy(status = ModelStatus.NeedsApiKey)
+                    }
+                    deliver(request) { callbacks.onError(failure.failure) }
+                }
             } catch (_: LinkageError) {
                 modelFailed(ModelProblem.UnsupportedDevice)
-                deliver(request, callbacks.onError)
+                deliver(request) { callbacks.onError(ReplyFailure.Generation) }
             } catch (_: Exception) {
-                deliver(request, callbacks.onError)
+                deliver(request) { callbacks.onError(ReplyFailure.Generation) }
             } finally {
                 generating = false
             }
@@ -302,13 +374,13 @@ class OfflineAiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerat
 
     override fun cancel() {
         requestId.incrementAndGet()
-        if (state.value.model == AiModel.GeminiNano) generationJob?.cancel()
+        if (state.value.model == AiModel.GeminiNano || state.value.model.isCloud) generationJob?.cancel()
         if (!disposed.get()) scope.launch { mutex.withLock { stopGeneration() } }
     }
 
     override fun reset() {
         requestId.incrementAndGet()
-        if (state.value.model == AiModel.GeminiNano) generationJob?.cancel()
+        if (state.value.model == AiModel.GeminiNano || state.value.model.isCloud) generationJob?.cancel()
         if (!disposed.get()) scope.launch {
             mutex.withLock {
                 stopGeneration()
@@ -354,11 +426,12 @@ class OfflineAiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerat
 
     override fun onCleared() {
         disposed.set(true)
+        keyScope.cancel()
         setupRequest.incrementAndGet()
         setupJob?.cancel()
         nanoCheckJob?.cancel()
         requestId.incrementAndGet()
-        if (state.value.model == AiModel.GeminiNano) generationJob?.cancel()
+        if (state.value.model == AiModel.GeminiNano || state.value.model.isCloud) generationJob?.cancel()
         scope.launch {
             mutex.withLock { releaseEngine() }
             runCatching { nano?.close() }

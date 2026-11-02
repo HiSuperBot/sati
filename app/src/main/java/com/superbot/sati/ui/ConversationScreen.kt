@@ -53,9 +53,11 @@ import androidx.compose.ui.unit.dp
 import com.superbot.sati.R
 import com.superbot.sati.ai.AiModel
 import com.superbot.sati.ai.NanoAvailability
+import com.superbot.sati.ai.ApiKeyStatus
+import com.superbot.sati.ai.ApiKeySetupState
 import com.superbot.sati.ai.ModelProblem
 import com.superbot.sati.ai.ModelStatus
-import com.superbot.sati.ai.OfflineModelState
+import com.superbot.sati.ai.AiModelState
 import com.superbot.sati.conversation.ConversationPhase
 import com.superbot.sati.conversation.ConversationState
 import com.superbot.sati.conversation.SpeechProblem
@@ -67,13 +69,20 @@ fun ConversationScreen(
     onTalk: () -> Unit,
     onCancel: () -> Unit,
     onOpenSettings: () -> Unit,
-    model: OfflineModelState = OfflineModelState(status = ModelStatus.Missing),
+    model: AiModelState = AiModelState(status = ModelStatus.Missing),
     onCancelDownload: () -> Unit = {},
     onRetryModel: () -> Unit = {},
     onNewConversation: () -> Unit = {},
     nanoAvailability: NanoAvailability = NanoAvailability.Checking,
     onSelectModel: (AiModel) -> Unit = {},
     onCheckNano: () -> Unit = {},
+    keySetup: ApiKeySetupState = ApiKeySetupState(),
+    keyStatus: ApiKeyStatus = ApiKeyStatus(),
+    onEditKey: () -> Unit = {},
+    onKeyDraftChange: (String) -> Unit = {},
+    onConnectKey: () -> Unit = {},
+    onDismissKey: () -> Unit = {},
+    onRemoveKey: () -> Unit = {},
 ) {
     val ready = model.status == ModelStatus.Ready
     var showModels by rememberSaveable { mutableStateOf(false) }
@@ -97,20 +106,22 @@ fun ConversationScreen(
                     style = MaterialTheme.typography.bodyLarge,
                 )
                 SatiEyes(state.phase)
-                OfflineModelCard(
+                ModelCard(
                     model, onCancelDownload, onRetryModel,
                     canChangeModel = !state.isActive,
                     onChangeModel = { showModels = true },
+                    keyStatus = keyStatus, onEditKey = onEditKey, onRemoveKey = onRemoveKey,
                 )
                 Text(
                     text = stringResource(
-                        if (ready || state.problem != null) state.statusResource()
+                        if (ready || state.problem != null || state.replyFailure != null) state.statusResource()
+                        else if (model.model.isCloud) R.string.api_key_required
                         else R.string.offline_setup_required,
                     ),
                     modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
                     style = MaterialTheme.typography.titleMedium,
                     textAlign = TextAlign.Center,
-                    color = if (state.problem != null) MaterialTheme.colorScheme.error
+                    color = if (state.problem != null || state.replyFailure != null) MaterialTheme.colorScheme.error
                         else MaterialTheme.colorScheme.onSurface,
                 )
                 val needsSettings = state.problem == SpeechProblem.PermissionSettings
@@ -150,12 +161,16 @@ fun ConversationScreen(
                     textAlign = TextAlign.Center,
                 )
                 Text(
-                    stringResource(R.string.offline_privacy),
+                    stringResource(if (model.model.isCloud) R.string.deepseek_privacy
+                        else R.string.offline_privacy),
                     style = MaterialTheme.typography.bodySmall,
                     textAlign = TextAlign.Center,
                 )
             }
         }
+    }
+    if (keySetup.isOpen) {
+        ApiKeySetupDialog(keySetup, onKeyDraftChange, onConnectKey, onDismissKey)
     }
     if (showModels) {
         ModelChooser(
@@ -201,6 +216,7 @@ private fun ModelChooser(
                                     AiModel.Qwen -> R.string.qwen_description
                                     AiModel.Gemma -> R.string.gemma_description
                                     AiModel.GeminiNano -> nanoAvailability.descriptionResource()
+                                    AiModel.DeepSeek -> R.string.deepseek_description
                                 }),
                                 style = MaterialTheme.typography.bodySmall,
                             )
@@ -235,63 +251,89 @@ private fun setupDescription(model: AiModel): String = stringResource(
         AiModel.Qwen -> R.string.qwen_description
         AiModel.Gemma -> R.string.gemma_description
         AiModel.GeminiNano -> R.string.nano_downloadable
+        AiModel.DeepSeek -> R.string.deepseek_description
     },
 )
 
 @Composable
-private fun OfflineModelCard(
-    state: OfflineModelState,
+private fun ModelCard(
+    state: AiModelState,
     onCancelDownload: () -> Unit,
     onRetry: () -> Unit,
     canChangeModel: Boolean,
     onChangeModel: () -> Unit,
+    keyStatus: ApiKeyStatus,
+    onEditKey: () -> Unit,
+    onRemoveKey: () -> Unit,
 ) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(state.model.displayName, style = MaterialTheme.typography.titleMedium)
+            Text(stringResource(if (state.model.isCloud) R.string.cloud_mode else R.string.on_device_mode),
+                style = MaterialTheme.typography.labelMedium)
             TextButton(onClick = onChangeModel, enabled = canChangeModel) {
                 Text(stringResource(R.string.change_model))
             }
-            Text(
-                stringResource(when (state.status) {
-                    ModelStatus.Ready -> R.string.offline_ready
-                    ModelStatus.Loading -> R.string.offline_loading
-                    ModelStatus.Downloading -> if (state.model == AiModel.GeminiNano)
-                        R.string.nano_downloading else R.string.offline_downloading
-                    else -> R.string.offline_missing
-                }, state.downloadPercent),
-                style = MaterialTheme.typography.titleSmall,
-                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
-            )
-            when (state.status) {
-                ModelStatus.Downloading -> {
-                    Text(setupDescription(state.model))
-                    if (state.model == AiModel.GeminiNano) {
-                        LinearProgressIndicator(Modifier.fillMaxWidth())
-                    } else {
-                        LinearProgressIndicator(
-                            progress = { state.downloadPercent / 100f },
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                    }
-                    TextButton(onClick = onCancelDownload) {
-                        Text(stringResource(R.string.cancel_download))
+            if (state.model.isCloud) {
+                Text(stringResource(when (state.status) {
+                    ModelStatus.Ready -> R.string.cloud_ready
+                    ModelStatus.Loading -> R.string.cloud_preparing
+                    else -> R.string.api_key_required
+                }), style = MaterialTheme.typography.titleSmall)
+                if (state.problem == ModelProblem.CredentialStorage) {
+                    Text(stringResource(R.string.error_key_storage))
+                }
+                TextButton(onClick = onEditKey, enabled = canChangeModel && keyStatus.loaded) {
+                    Text(stringResource(if (keyStatus.hasKey) R.string.change_api_key else R.string.set_api_key))
+                }
+                if (keyStatus.hasKey) {
+                    TextButton(onClick = onRemoveKey, enabled = canChangeModel) {
+                        Text(stringResource(R.string.remove_api_key))
                     }
                 }
-                ModelStatus.Loading -> CircularProgressIndicator(Modifier.size(24.dp))
-                ModelStatus.Ready -> Unit
-                else -> {
-                    if (state.problem == null) Text(setupDescription(state.model))
-                    else Text(stringResource(when (state.problem) {
-                        ModelProblem.DownloadFailed -> R.string.model_download_failed
-                        ModelProblem.VerificationFailed -> R.string.model_verification_failed
-                        ModelProblem.DownloadCanceled -> R.string.model_download_canceled
-                        ModelProblem.LoadFailed -> R.string.model_load_failed
-                        ModelProblem.UnsupportedDevice -> R.string.model_device_unsupported
-                        ModelProblem.NanoUnavailable -> R.string.nano_unavailable
-                        null -> R.string.offline_setup
-                    }))
-                    TextButton(onClick = onRetry) { Text(stringResource(R.string.retry_setup)) }
+            } else {
+                Text(
+                    stringResource(when (state.status) {
+                        ModelStatus.Ready -> R.string.offline_ready
+                        ModelStatus.Loading -> R.string.offline_loading
+                        ModelStatus.Downloading -> if (state.model == AiModel.GeminiNano)
+                            R.string.nano_downloading else R.string.offline_downloading
+                        else -> R.string.offline_missing
+                    }, state.downloadPercent),
+                    style = MaterialTheme.typography.titleSmall,
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                )
+                when (state.status) {
+                    ModelStatus.Downloading -> {
+                        Text(setupDescription(state.model))
+                        if (state.model == AiModel.GeminiNano) {
+                            LinearProgressIndicator(Modifier.fillMaxWidth())
+                        } else {
+                            LinearProgressIndicator(
+                                progress = { state.downloadPercent / 100f },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                        TextButton(onClick = onCancelDownload) {
+                            Text(stringResource(R.string.cancel_download))
+                        }
+                    }
+                    ModelStatus.Loading -> CircularProgressIndicator(Modifier.size(24.dp))
+                    ModelStatus.Ready -> Unit
+                    else -> {
+                        val problem = state.problem
+                        if (problem == null) Text(setupDescription(state.model))
+                        else Text(stringResource(when (problem) {
+                            ModelProblem.DownloadFailed -> R.string.model_download_failed
+                            ModelProblem.VerificationFailed -> R.string.model_verification_failed
+                            ModelProblem.DownloadCanceled -> R.string.model_download_canceled
+                            ModelProblem.LoadFailed -> R.string.model_load_failed
+                            ModelProblem.UnsupportedDevice -> R.string.model_device_unsupported
+                            ModelProblem.NanoUnavailable -> R.string.nano_unavailable
+                            ModelProblem.CredentialStorage -> R.string.error_key_storage
+                        }))
+                        TextButton(onClick = onRetry) { Text(stringResource(R.string.retry_setup)) }
+                    }
                 }
             }
         }
@@ -354,7 +396,7 @@ private fun SatiEyes(phase: ConversationPhase) {
     }
 }
 
-private fun ConversationState.statusResource(): Int = when (problem) {
+private fun ConversationState.statusResource(): Int = replyFailure?.messageResource() ?: when (problem) {
     SpeechProblem.PermissionDenied -> R.string.error_permission
     SpeechProblem.PermissionSettings -> R.string.error_permission_settings
     SpeechProblem.RecognitionUnavailable -> R.string.error_recognition_unavailable
@@ -384,4 +426,16 @@ private fun ConversationState.statusResource(): Int = when (problem) {
 @Composable
 private fun ConversationPreview() {
     SatiTheme { ConversationScreen(ConversationState(), {}, {}, {}) }
+}
+
+@Preview(name = "DeepSeek setup", showBackground = true)
+@Composable
+private fun DeepSeekSetupPreview() {
+    SatiTheme {
+        ConversationScreen(
+            ConversationState(), {}, {}, {},
+            model = AiModelState(status = ModelStatus.Ready),
+            keySetup = ApiKeySetupState(isOpen = true),
+        )
+    }
 }

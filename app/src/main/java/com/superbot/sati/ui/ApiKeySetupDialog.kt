@@ -1,0 +1,93 @@
+package com.superbot.sati.ui
+
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.dp
+import com.superbot.sati.R
+import com.superbot.sati.ai.ApiKeySetupState
+
+@Composable
+internal fun ApiKeySetupDialog(
+    state: ApiKeySetupState,
+    onDraftChange: (String) -> Unit,
+    onConnect: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var visible by remember { mutableStateOf(false) }
+    val keyboard = LocalSoftwareKeyboardController.current
+    val uri = LocalUriHandler.current
+    DisposableEffect(Unit) { onDispose { keyboard?.hide() } }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.deepseek_key_title)) },
+        text = {
+            Column(
+                Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(stringResource(R.string.deepseek_privacy))
+                OutlinedTextField(
+                    value = state.draft,
+                    onValueChange = onDraftChange,
+                    modifier = Modifier.fillMaxWidth().testTag("deepseek-api-key"),
+                    label = { Text(stringResource(R.string.api_key)) },
+                    singleLine = true,
+                    enabled = !state.isValidating,
+                    visualTransformation = if (visible) VisualTransformation.None
+                        else PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Password, autoCorrectEnabled = false,
+                    ),
+                    isError = state.invalidInput || state.failure != null,
+                    trailingIcon = {
+                        TextButton(onClick = { visible = !visible }) {
+                            Text(stringResource(if (visible) R.string.hide_key else R.string.show_key))
+                        }
+                    },
+                )
+                if (state.invalidInput) Text(stringResource(R.string.api_key_invalid_input))
+                state.failure?.let { Text(stringResource(it.messageResource())) }
+                if (state.isValidating) {
+                    CircularProgressIndicator()
+                    Text(stringResource(R.string.api_key_checking))
+                }
+                Text(stringResource(R.string.api_key_storage))
+                TextButton(onClick = { uri.openUri("https://platform.deepseek.com") }) {
+                    Text(stringResource(R.string.get_api_key))
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConnect, enabled = !state.isValidating && state.draft.isNotBlank()) {
+                Text(stringResource(R.string.connect))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
+        },
+    )
+}

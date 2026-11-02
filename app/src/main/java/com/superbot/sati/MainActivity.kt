@@ -16,6 +16,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -24,7 +25,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.superbot.sati.ai.OfflineAiViewModel
+import com.superbot.sati.ai.AiViewModel
 import com.superbot.sati.conversation.ConversationViewModel
 import com.superbot.sati.conversation.SpeechProblem
 import com.superbot.sati.speech.AndroidVoiceSession
@@ -34,27 +35,32 @@ import com.superbot.sati.ui.theme.SatiTheme
 class MainActivity : ComponentActivity() {
     private lateinit var conversation: ConversationViewModel
     private lateinit var voice: AndroidVoiceSession
-    private lateinit var offlineAi: OfflineAiViewModel
+    private lateinit var ai: AiViewModel
     private var foreground = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         conversation = ViewModelProvider(this)[ConversationViewModel::class.java]
         voice = AndroidVoiceSession(this)
-        offlineAi = ViewModelProvider(this)[OfflineAiViewModel::class.java]
+        ai = ViewModelProvider(this)[AiViewModel::class.java]
         enableEdgeToEdge()
         setContent {
             SatiTheme {
                 val state by conversation.state.collectAsStateWithLifecycle()
-                val model by offlineAi.state.collectAsStateWithLifecycle()
-                val nanoAvailability by offlineAi.nanoAvailability.collectAsStateWithLifecycle()
+                val model by ai.state.collectAsStateWithLifecycle()
+                val nanoAvailability by ai.nanoAvailability.collectAsStateWithLifecycle()
+                val keySetup by ai.keySetup.collectAsStateWithLifecycle()
+                val keyStatus by ai.keyStatus.collectAsStateWithLifecycle()
+                LaunchedEffect(model.model, keyStatus.revision) {
+                    conversation.bindBackend("${model.model.id}:${keyStatus.revision}", ai)
+                }
                 var showRationale by rememberSaveable { mutableStateOf(false) }
                 val microphonePermission = rememberLauncherForActivityResult(
                     ActivityResultContracts.RequestPermission(),
                 ) { granted ->
                     if (granted) {
                         conversation.refreshMicrophonePermission(true)
-                        if (foreground) conversation.startConversation(voice, offlineAi)
+                        if (foreground) conversation.startConversation(voice, ai)
                     } else {
                         conversation.showProblem(
                             if (ActivityCompat.shouldShowRequestPermissionRationale(
@@ -69,7 +75,7 @@ class MainActivity : ComponentActivity() {
                     state = state,
                     onTalk = {
                         when {
-                            hasMicrophonePermission() -> conversation.startConversation(voice, offlineAi)
+                            hasMicrophonePermission() -> conversation.startConversation(voice, ai)
                             ActivityCompat.shouldShowRequestPermissionRationale(
                                 this, Manifest.permission.RECORD_AUDIO,
                             ) -> showRationale = true
@@ -78,16 +84,18 @@ class MainActivity : ComponentActivity() {
                     },
                     model = model,
                     nanoAvailability = nanoAvailability,
-                    onCheckNano = offlineAi::refreshNanoAvailability,
-                    onSelectModel = { selected ->
-                        if (selected != model.model) {
-                            conversation.newConversation(offlineAi)
-                            offlineAi.selectModel(selected)
-                        }
-                    },
-                    onCancelDownload = offlineAi::cancelDownload,
-                    onRetryModel = offlineAi::retrySetup,
-                    onNewConversation = { conversation.newConversation(offlineAi) },
+                    onCheckNano = ai::refreshNanoAvailability,
+                    onSelectModel = ai::selectModel,
+                    keySetup = keySetup,
+                    keyStatus = keyStatus,
+                    onEditKey = ai::openKeySetup,
+                    onKeyDraftChange = ai::editApiKey,
+                    onConnectKey = ai::connectApiKey,
+                    onDismissKey = ai::dismissKeySetup,
+                    onRemoveKey = ai::removeApiKey,
+                    onCancelDownload = ai::cancelDownload,
+                    onRetryModel = ai::retrySetup,
+                    onNewConversation = { conversation.newConversation(ai) },
                     onCancel = conversation::cancelConversation,
                     onOpenSettings = {
                         try {
@@ -132,6 +140,7 @@ class MainActivity : ComponentActivity() {
         foreground = false
         conversation.cancelConversation()
         voice.cancel()
+        if (isChangingConfigurations) ai.pauseKeyValidation() else ai.dismissKeySetup()
         super.onStop()
     }
 

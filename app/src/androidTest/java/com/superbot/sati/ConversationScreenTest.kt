@@ -1,6 +1,12 @@
 package com.superbot.sati
 
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assert
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.assertIsNotEnabled
@@ -9,10 +15,13 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.superbot.sati.ai.ApiKeySetupState
+import com.superbot.sati.ai.ApiKeyStatus
 import com.superbot.sati.ai.AiModel
 import com.superbot.sati.ai.NanoAvailability
 import com.superbot.sati.ai.ModelStatus
-import com.superbot.sati.ai.OfflineModelState
+import com.superbot.sati.ai.ReplyFailure
+import com.superbot.sati.ai.AiModelState
 import com.superbot.sati.conversation.ConversationPhase
 import com.superbot.sati.conversation.ConversationState
 import com.superbot.sati.conversation.SpeechProblem
@@ -27,7 +36,7 @@ import org.junit.runner.RunWith
 class ConversationScreenTest {
     @get:Rule
     val compose = createComposeRule()
-    private val ready = OfflineModelState(status = ModelStatus.Ready)
+    private val ready = AiModelState(status = ModelStatus.Ready)
 
     @Test
     fun idleScreenStartsOnlyOnTalk() {
@@ -171,7 +180,7 @@ class ConversationScreenTest {
             SatiTheme {
                 ConversationScreen(
                     ConversationState(), {}, {}, {},
-                    model = OfflineModelState(
+                    model = AiModelState(
                         status = ModelStatus.Downloading, downloadedBytes = 306_861_132L,
                     ),
                     onCancelDownload = { canceled++ },
@@ -200,13 +209,13 @@ class ConversationScreenTest {
         }
         compose.onNodeWithText("Change model").performScrollTo().performClick()
         assertEquals(emptyList<AiModel>(), choices)
-        compose.onNodeWithText("Choose offline model").assertIsDisplayed()
+        compose.onNodeWithText("Choose model").assertIsDisplayed()
         compose.onNodeWithTag("model-choice-gemini-nano").assertIsNotEnabled()
         compose.onNodeWithText("2.59 GB download. Larger model; needs more free storage and memory.")
             .performScrollTo().assertIsDisplayed()
         compose.onNodeWithTag("model-choice-gemma4-e2b").performScrollTo().performClick()
         assertEquals(listOf(AiModel.Gemma), choices)
-        compose.onNodeWithText("Choose offline model").assertDoesNotExist()
+        compose.onNodeWithText("Choose model").assertDoesNotExist()
     }
 
     @Test
@@ -233,7 +242,7 @@ class ConversationScreenTest {
             SatiTheme {
                 ConversationScreen(
                     ConversationState(), {}, {}, {},
-                    model = OfflineModelState(
+                    model = AiModelState(
                         status = ModelStatus.Downloading,
                         downloadedBytes = AiModel.Gemma.downloadBytes / 2,
                         model = AiModel.Gemma,
@@ -246,6 +255,99 @@ class ConversationScreenTest {
         compose.onNodeWithText("Change model").performScrollTo().performClick()
         compose.onNodeWithTag("model-choice-qwen3-0.6b").performScrollTo().performClick()
         assertEquals(AiModel.Qwen, selected)
+    }
+
+    @Test
+    fun selectingDeepSeekOpensMaskedKeySetupAndConnectUsesThePastedKey() {
+        val setup = mutableStateOf(ApiKeySetupState())
+        var connected = ""
+        compose.setContent {
+            SatiTheme {
+                ConversationScreen(
+                    ConversationState(), {}, {}, {}, model = ready,
+                    keySetup = setup.value,
+                    onSelectModel = {
+                        if (it == AiModel.DeepSeek) setup.value = ApiKeySetupState(isOpen = true)
+                    },
+                    onKeyDraftChange = { setup.value = setup.value.copy(draft = it) },
+                    onConnectKey = { connected = setup.value.draft },
+                    onDismissKey = { setup.value = ApiKeySetupState() },
+                )
+            }
+        }
+        compose.onNodeWithText("Change model").performScrollTo().performClick()
+        compose.onNodeWithTag("model-choice-deepseek-flash").performScrollTo().performClick()
+        compose.onNodeWithText("Connect DeepSeek").assertIsDisplayed()
+        compose.onNodeWithText("Connect").assertIsNotEnabled()
+        compose.onNodeWithTag("deepseek-api-key")
+            .assert(SemanticsMatcher.keyIsDefined(SemanticsProperties.Password))
+            .performTextInput("test-only-key")
+        compose.onNodeWithText("Connect").performClick()
+        assertEquals("test-only-key", connected)
+        compose.onNodeWithText("Cancel").performClick()
+        compose.onNodeWithText("Connect DeepSeek").assertDoesNotExist()
+        compose.onNodeWithText("Qwen3 0.6B").performScrollTo().assertIsDisplayed()
+        compose.onAllNodes(androidx.compose.ui.test.hasSetTextAction()).assertCountEquals(0)
+    }
+
+    @Test
+    fun savedCloudKeyEnablesVoiceAndOffersKeyManagement() {
+        var edits = 0
+        var removals = 0
+        compose.setContent {
+            SatiTheme {
+                ConversationScreen(
+                    ConversationState(), {}, {}, {},
+                    model = AiModelState(status = ModelStatus.Ready, model = AiModel.DeepSeek),
+                    keyStatus = ApiKeyStatus(loaded = true, hasKey = true),
+                    onEditKey = { edits++ },
+                    onRemoveKey = { removals++ },
+                )
+            }
+        }
+        compose.onNodeWithText("Cloud · internet required").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Talk").performScrollTo().assertIsEnabled()
+        compose.onNodeWithText("Offline AI ready").assertDoesNotExist()
+        compose.onAllNodes(androidx.compose.ui.test.hasSetTextAction()).assertCountEquals(0)
+        compose.onNodeWithText("Change API key").performScrollTo().performClick()
+        compose.onNodeWithText("Remove API key").performScrollTo().performClick()
+        assertEquals(1, edits)
+        assertEquals(1, removals)
+    }
+
+    @Test
+    fun removedKeyDisablesTalkAndOffersSetup() {
+        var edits = 0
+        compose.setContent {
+            SatiTheme {
+                ConversationScreen(
+                    ConversationState(), {}, {}, {},
+                    model = AiModelState(status = ModelStatus.NeedsApiKey, model = AiModel.DeepSeek),
+                    keyStatus = ApiKeyStatus(loaded = true),
+                    onEditKey = { edits++ },
+                )
+            }
+        }
+        compose.onNodeWithText("Talk").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("Set API key").performScrollTo().performClick()
+        assertEquals(1, edits)
+    }
+
+    @Test
+    fun cloudBalanceErrorIsSeparateFromMicrophoneErrors() {
+        compose.setContent {
+            SatiTheme {
+                ConversationScreen(
+                    ConversationState(phase = ConversationPhase.Error, replyFailure = ReplyFailure.Balance),
+                    {}, {}, {},
+                    model = AiModelState(status = ModelStatus.Ready, model = AiModel.DeepSeek),
+                )
+            }
+        }
+        compose.onNodeWithText(
+            "Your DeepSeek API balance is insufficient. Add credit to your DeepSeek account, then try again.",
+        ).performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Try again").performScrollTo().assertIsEnabled()
     }
 
     @Test
