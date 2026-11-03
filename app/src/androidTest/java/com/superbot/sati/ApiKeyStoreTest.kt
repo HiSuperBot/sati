@@ -46,6 +46,20 @@ class ApiKeyStoreTest {
     }
 
     @Test
+    fun providerCredentialsUseIndependentCiphertextAndKeystoreAliases() =
+        withStore { _, groq, groqFactory ->
+            withStore { _, deepSeek, deepFactory ->
+                groq.save("groq-test-key")
+                deepSeek.save("deepseek-test-key")
+                assertEquals("groq-test-key", groqFactory().load())
+                assertEquals("deepseek-test-key", deepFactory().load())
+                groq.clear()
+                assertNull(groqFactory().load())
+                assertEquals("deepseek-test-key", deepFactory().load())
+            }
+        }
+
+    @Test
     fun tamperingRequiresReentryAndAllowsSavingANewKey() = withStore { file, store, factory ->
         store.save("test-only-secret")
         file.writeBytes(file.readBytes().also { it[it.lastIndex] = (it.last().toInt() xor 1).toByte() })

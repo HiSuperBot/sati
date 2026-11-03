@@ -29,6 +29,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.superbot.sati.R
 import com.superbot.sati.ai.ApiKeySetupState
+import com.superbot.sati.ai.CloudProvider
 
 @Composable
 internal fun ApiKeySetupDialog(
@@ -37,24 +38,27 @@ internal fun ApiKeySetupDialog(
     onConnect: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var visible by remember { mutableStateOf(false) }
+    var visible by remember(state.provider) { mutableStateOf(false) }
+    val groq = state.provider == CloudProvider.Groq
+    val now by rememberWallClock(state.stageFailure?.retryAtMillis)
+    val remaining = state.stageFailure?.remainingSeconds(now) ?: 0
     val keyboard = LocalSoftwareKeyboardController.current
     val uri = LocalUriHandler.current
     DisposableEffect(Unit) { onDispose { keyboard?.hide() } }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.deepseek_key_title)) },
+        title = { Text(stringResource(if (groq) R.string.groq_key_title else R.string.deepseek_key_title)) },
         text = {
             Column(
                 Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Text(stringResource(R.string.deepseek_privacy))
+                Text(stringResource(if (groq) R.string.groq_key_setup_hint else R.string.deepseek_privacy))
                 OutlinedTextField(
                     value = state.draft,
                     onValueChange = onDraftChange,
-                    modifier = Modifier.fillMaxWidth().testTag("deepseek-api-key"),
-                    label = { Text(stringResource(R.string.api_key)) },
+                    modifier = Modifier.fillMaxWidth().testTag(if (groq) "groq-api-key" else "deepseek-api-key"),
+                    label = { Text(stringResource(if (groq) R.string.groq_api_key else R.string.api_key)) },
                     singleLine = true,
                     enabled = !state.isValidating,
                     visualTransformation = if (visible) VisualTransformation.None
@@ -70,19 +74,22 @@ internal fun ApiKeySetupDialog(
                     },
                 )
                 if (state.invalidInput) Text(stringResource(R.string.api_key_invalid_input))
-                state.failure?.let { Text(stringResource(it.messageResource())) }
+                state.failure?.let {
+                    Text(stringResource(state.stageFailure?.messageResource() ?: it.messageResource()))
+                }
+                if (remaining > 0) Text(stringResource(R.string.retry_countdown, remaining))
                 if (state.isValidating) {
                     CircularProgressIndicator()
                     Text(stringResource(R.string.api_key_checking))
                 }
                 Text(stringResource(R.string.api_key_storage))
-                TextButton(onClick = { uri.openUri("https://platform.deepseek.com") }) {
-                    Text(stringResource(R.string.get_api_key))
+                TextButton(onClick = { uri.openUri(state.provider.keyUrl) }) {
+                    Text(stringResource(if (groq) R.string.get_groq_key else R.string.get_api_key))
                 }
             }
         },
         confirmButton = {
-            TextButton(onClick = onConnect, enabled = !state.isValidating && state.draft.isNotBlank()) {
+            TextButton(onClick = onConnect, enabled = !state.isValidating && state.draft.isNotBlank() && remaining == 0L) {
                 Text(stringResource(R.string.connect))
             }
         },

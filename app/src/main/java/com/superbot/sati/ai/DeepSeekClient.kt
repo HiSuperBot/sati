@@ -27,8 +27,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 
-internal interface DeepSeekService {
-    suspend fun validateKey(key: String)
+internal interface DeepSeekService : ApiKeyValidator {
     fun stream(key: String, input: String, history: List<ConversationTurn>): Flow<String>
 }
 
@@ -157,7 +156,7 @@ internal class DeepSeekClient(
 }
 
 /** SSE comments/keepalives, multiple data lines, and arbitrary network chunk boundaries. */
-private fun readEvents(reader: BufferedReader, onEvent: (String) -> Boolean): Boolean {
+internal fun readEvents(reader: BufferedReader, onEvent: (String) -> Boolean): Boolean {
     val data = StringBuilder()
     while (true) {
         // Bound each line before allocating an unbounded String.

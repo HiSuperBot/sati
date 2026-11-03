@@ -39,22 +39,22 @@ class ConversationScreenTest {
     private val ready = AiModelState(status = ModelStatus.Ready)
 
     @Test
-    fun idleScreenStartsOnlyOnTalk() {
-        var starts = 0
+    fun idleScreenShowsPauseWithoutRequiringATalkTap() {
+        var pauses = 0
         compose.setContent {
             SatiTheme {
-                ConversationScreen(ConversationState(), { starts++ }, {}, {}, model = ready)
+                ConversationScreen(ConversationState(), {}, { pauses++ }, {}, model = ready)
             }
         }
-        compose.onNodeWithText("Tap Talk and say something in English.")
-            .performScrollTo().assertIsDisplayed()
-        assertEquals(0, starts)
-        compose.onNodeWithText("Talk").performScrollTo().performClick()
-        assertEquals(1, starts)
+        compose.onNodeWithText("Sati will listen when ready.").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Talk").assertDoesNotExist()
+        assertEquals(0, pauses)
+        compose.onNodeWithText("Pause").performScrollTo().performClick()
+        assertEquals(1, pauses)
     }
 
     @Test
-    fun activeTurnOffersCancelAndDisplaysConversation() {
+    fun activeTurnOffersPauseAndDisplaysConversation() {
         var cancellations = 0
         compose.setContent {
             SatiTheme {
@@ -64,8 +64,8 @@ class ConversationScreenTest {
                         transcript = "My name is Mina",
                         reply = "Nice to meet you, Mina!",
                     ),
-                    onTalk = { error("Cannot start another turn while speaking") },
-                    onCancel = { cancellations++ },
+                    onRetry = { error("Cannot start another turn while speaking") },
+                    onPauseResume = { cancellations++ },
                     onOpenSettings = {},
                     model = ready,
                 )
@@ -73,7 +73,7 @@ class ConversationScreenTest {
         }
         compose.onNodeWithText("My name is Mina").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("Sati is speaking…").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithText("Cancel").performScrollTo().performClick()
+        compose.onNodeWithText("Pause").performScrollTo().performClick()
         assertEquals(1, cancellations)
         compose.onNodeWithText("Change model").performScrollTo().assertIsNotEnabled()
     }
@@ -87,8 +87,8 @@ class ConversationScreenTest {
                     ConversationState(
                         phase = ConversationPhase.Error, problem = SpeechProblem.PermissionSettings,
                     ),
-                    onTalk = { error("Must recover permission first") },
-                    onCancel = {},
+                    onRetry = { error("Must recover permission first") },
+                    onPauseResume = {},
                     onOpenSettings = { settingsOpened++ },
                     model = ready,
                 )
@@ -105,14 +105,14 @@ class ConversationScreenTest {
             SatiTheme {
                 ConversationScreen(
                     ConversationState(),
-                    onTalk = { error("Cannot record without a local model") },
-                    onCancel = {},
+                    onRetry = { error("Cannot record without a local model") },
+                    onPauseResume = {},
                     onOpenSettings = {},
                     onRetryModel = { retries++ },
                 )
             }
         }
-        compose.onNodeWithText("Talk").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("Pause").performScrollTo().assertIsNotEnabled()
         compose.onNodeWithText("Retry setup").performScrollTo().performClick()
         assertEquals(1, retries)
     }
@@ -137,14 +137,14 @@ class ConversationScreenTest {
     }
 
     @Test
-    fun speechModelSetupOffersCancelWithoutStartingAnotherRecording() {
+    fun speechModelSetupOffersPauseWithoutStartingAnotherRecording() {
         var cancellations = 0
         compose.setContent {
             SatiTheme {
                 ConversationScreen(
                     ConversationState(phase = ConversationPhase.PreparingSpeech),
-                    onTalk = { error("Setup must finish before recording") },
-                    onCancel = { cancellations++ },
+                    onRetry = { error("Setup must finish before recording") },
+                    onPauseResume = { cancellations++ },
                     onOpenSettings = {},
                     model = ready,
                 )
@@ -152,7 +152,7 @@ class ConversationScreenTest {
         }
         compose.onNodeWithText("Downloading English speech data… Please wait.")
             .performScrollTo().assertIsDisplayed()
-        compose.onNodeWithText("Cancel").performScrollTo().performClick()
+        compose.onNodeWithText("Pause").performScrollTo().performClick()
         assertEquals(1, cancellations)
         compose.onAllNodes(androidx.compose.ui.test.hasSetTextAction()).assertCountEquals(0)
     }
@@ -189,7 +189,7 @@ class ConversationScreenTest {
         }
         compose.onNodeWithText("Downloading offline AI: 50%")
             .performScrollTo().assertIsDisplayed()
-        compose.onNodeWithText("Talk").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("Pause").performScrollTo().assertIsNotEnabled()
         compose.onNodeWithText("Choose model file").assertDoesNotExist()
         compose.onNodeWithText("Cancel download").performScrollTo().performClick()
         assertEquals(1, canceled)
@@ -306,7 +306,7 @@ class ConversationScreenTest {
             }
         }
         compose.onNodeWithText("Cloud · internet required").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithText("Talk").performScrollTo().assertIsEnabled()
+        compose.onNodeWithText("Pause").performScrollTo().assertIsEnabled()
         compose.onNodeWithText("Offline AI ready").assertDoesNotExist()
         compose.onAllNodes(androidx.compose.ui.test.hasSetTextAction()).assertCountEquals(0)
         compose.onNodeWithText("Change API key").performScrollTo().performClick()
@@ -316,7 +316,7 @@ class ConversationScreenTest {
     }
 
     @Test
-    fun removedKeyDisablesTalkAndOffersSetup() {
+    fun removedKeyDisablesListeningAndOffersSetup() {
         var edits = 0
         compose.setContent {
             SatiTheme {
@@ -328,7 +328,7 @@ class ConversationScreenTest {
                 )
             }
         }
-        compose.onNodeWithText("Talk").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("Pause").performScrollTo().assertIsNotEnabled()
         compose.onNodeWithText("Set API key").performScrollTo().performClick()
         assertEquals(1, edits)
     }
@@ -348,6 +348,228 @@ class ConversationScreenTest {
             "Your DeepSeek API balance is insufficient. Add credit to your DeepSeek account, then try again.",
         ).performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("Try again").performScrollTo().assertIsEnabled()
+    }
+
+
+    @Test
+    fun pauseAndResumeUpdateTheControlWithoutAddingATalkButton() {
+        val state = mutableStateOf(ConversationState(phase = ConversationPhase.Listening))
+        var toggles = 0
+        compose.setContent {
+            SatiTheme {
+                ConversationScreen(
+                    state.value, {},
+                    {
+                        toggles++
+                        state.value = state.value.copy(
+                            phase = ConversationPhase.Idle, isPaused = !state.value.isPaused,
+                        )
+                    },
+                    {}, model = ready,
+                )
+            }
+        }
+        compose.onNodeWithText("Pause").performScrollTo().performClick()
+        compose.onNodeWithText("Listening paused.").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Resume").performScrollTo().performClick()
+        compose.onNodeWithText("Pause").performScrollTo().assertIsEnabled()
+        compose.onNodeWithText("Talk").assertDoesNotExist()
+        assertEquals(2, toggles)
+    }
+
+    @Test
+    fun listeningAllowsStartOverAndModelChooserSuspendsTheMicrophone() {
+        val blocking = mutableListOf<Boolean>()
+        var resets = 0
+        compose.setContent {
+            SatiTheme {
+                ConversationScreen(
+                    ConversationState(phase = ConversationPhase.Listening), {}, {}, {},
+                    model = ready,
+                    onNewConversation = { resets++ },
+                    onDialogVisibilityChanged = { blocking += it },
+                )
+            }
+        }
+        compose.onNodeWithText("Start over").performScrollTo().performClick()
+        assertEquals(1, resets)
+        compose.onNodeWithText("Change model").performScrollTo().performClick()
+        compose.onNodeWithText("Choose model").assertIsDisplayed()
+        compose.runOnIdle { assertEquals(true, blocking.last()) }
+        compose.onNodeWithText("Close").performClick()
+        compose.runOnIdle { assertEquals(false, blocking.last()) }
+    }
+
+    @Test
+    fun deniedPermissionOffersAnExplicitRequestWithoutStartingListening() {
+        var requests = 0
+        compose.setContent {
+            SatiTheme {
+                ConversationScreen(
+                    ConversationState(
+                        phase = ConversationPhase.Error, problem = SpeechProblem.PermissionDenied,
+                    ),
+                    onRetry = { requests++ },
+                    onPauseResume = { error("Permission is required first") },
+                    onOpenSettings = {},
+                    model = ready,
+                )
+            }
+        }
+        assertEquals(0, requests)
+        compose.onNodeWithText("Allow microphone").performScrollTo().performClick()
+        assertEquals(1, requests)
+        compose.onNodeWithText("Talk").assertDoesNotExist()
+    }
+
+    @Test
+    fun keySetupBlocksListeningUntilDismissed() {
+        val setup = mutableStateOf(ApiKeySetupState(isOpen = true))
+        val blocking = mutableListOf<Boolean>()
+        compose.setContent {
+            SatiTheme {
+                ConversationScreen(
+                    ConversationState(), {}, {}, {}, model = ready,
+                    keySetup = setup.value,
+                    onDismissKey = { setup.value = ApiKeySetupState() },
+                    onDialogVisibilityChanged = { blocking += it },
+                )
+            }
+        }
+        compose.onNodeWithText("Connect DeepSeek").assertIsDisplayed()
+        compose.runOnIdle { assertEquals(true, blocking.last()) }
+        compose.onNodeWithText("Cancel").performClick()
+        compose.runOnIdle { assertEquals(false, blocking.last()) }
+    }
+
+
+    @Test
+    fun threeStagesCanBeSelectedIndependentlyWithTheSameGroqConnection() {
+        val config = mutableStateOf(com.superbot.sati.ai.PipelineConfig())
+        compose.setContent {
+            SatiTheme {
+                ConversationScreen(
+                    ConversationState(), {}, {}, {},
+                    model = AiModelState(status = ModelStatus.Ready, model = config.value.chat),
+                    config = config.value,
+                    groqKeyStatus = ApiKeyStatus(loaded = true, hasKey = true),
+                    keyStatus = ApiKeyStatus(loaded = true, hasKey = true),
+                    onSelectStt = { config.value = config.value.copy(stt = it) },
+                    onSelectTts = { config.value = config.value.copy(tts = it) },
+                    onSelectModel = { config.value = config.value.copy(chat = it) },
+                    onSelectVoice = { config.value = config.value.copy(voice = it) },
+                )
+            }
+        }
+        compose.onNodeWithText("STT · Listen").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Model · Conversation").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("TTS · Speak").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Change STT").performScrollTo().performClick()
+        compose.onNodeWithTag("speech-choice-whisper-large-v3-turbo").performScrollTo().performClick()
+        compose.onNodeWithText("Change model").performScrollTo().performClick()
+        compose.onNodeWithTag("model-choice-openai/gpt-oss-20b").performScrollTo().performClick()
+        compose.onNodeWithText("Change TTS").performScrollTo().performClick()
+        compose.onNodeWithTag("speech-choice-canopylabs/orpheus-v1-english").performScrollTo().performClick()
+        compose.onNodeWithText("Voice: Troy").performScrollTo().performClick()
+        compose.onNodeWithTag("speech-choice-daniel").performScrollTo().performClick()
+        compose.runOnIdle {
+            assertEquals(com.superbot.sati.ai.SttModel.WhisperTurbo, config.value.stt)
+            assertEquals(AiModel.Groq20, config.value.chat)
+            assertEquals(com.superbot.sati.ai.TtsModel.Orpheus, config.value.tts)
+            assertEquals(com.superbot.sati.ai.OrpheusVoice.Daniel, config.value.voice)
+        }
+        compose.onNodeWithTag("groq-api-key").assertDoesNotExist()
+        compose.onNodeWithText("Talk").assertDoesNotExist()
+        compose.onAllNodes(androidx.compose.ui.test.hasSetTextAction()).assertCountEquals(0)
+    }
+
+    @Test
+    fun aMissingGroqKeyOpensMaskedSetupAndCancelPreservesThePreviousStage() {
+        val setup = mutableStateOf(ApiKeySetupState())
+        val config = com.superbot.sati.ai.PipelineConfig()
+        compose.setContent {
+            SatiTheme {
+                ConversationScreen(
+                    ConversationState(), {}, {}, {}, model = ready, config = config,
+                    groqKeyStatus = ApiKeyStatus(loaded = true),
+                    keySetup = setup.value,
+                    onSelectStt = {
+                        setup.value = ApiKeySetupState(
+                            isOpen = true, provider = com.superbot.sati.ai.CloudProvider.Groq)
+                    },
+                    onKeyDraftChange = { setup.value = setup.value.copy(draft = it) },
+                    onDismissKey = { setup.value = ApiKeySetupState() },
+                )
+            }
+        }
+        compose.onNodeWithText("Change STT").performScrollTo().performClick()
+        compose.onNodeWithTag("speech-choice-whisper-large-v3-turbo").performScrollTo().performClick()
+        compose.onNodeWithText("Connect Groq").assertIsDisplayed()
+        compose.onNodeWithTag("groq-api-key")
+            .assert(SemanticsMatcher.keyIsDefined(SemanticsProperties.Password))
+            .performTextInput("test-groq-key")
+        compose.onNodeWithText("Cancel").performClick()
+        compose.onNodeWithTag("groq-api-key").assertDoesNotExist()
+        compose.runOnIdle { assertEquals(com.superbot.sati.ai.SttModel.Android, config.stt) }
+        compose.onAllNodes(androidx.compose.ui.test.hasSetTextAction()).assertCountEquals(0)
+    }
+
+    @Test
+    fun aTtsLimitShowsACountdownAndAnExplicitOnDeviceRecoveryWithoutRetrying() {
+        var switched = 0
+        compose.setContent {
+            SatiTheme {
+                ConversationScreen(
+                    ConversationState(
+                        phase = ConversationPhase.Error, reply = "Hello friend!",
+                        stageFailure = com.superbot.sati.ai.StageFailure(
+                            com.superbot.sati.ai.PipelineStage.Tts,
+                            com.superbot.sati.ai.CloudProvider.Groq,
+                            "canopylabs/orpheus-v1-english", ReplyFailure.RateLimit,
+                            System.currentTimeMillis() + 60_000,
+                        ),
+                    ),
+                    onRetry = { error("A cooldown must not submit any request") },
+                    onPauseResume = {}, onOpenSettings = {}, model = ready,
+                    config = com.superbot.sati.ai.PipelineConfig(tts = com.superbot.sati.ai.TtsModel.Orpheus),
+                    groqKeyStatus = ApiKeyStatus(loaded = true, hasKey = true),
+                    onUseDevice = { switched++ },
+                )
+            }
+        }
+        compose.onNodeWithTag("retry-stage").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("Your reply is saved. Retry resumes the unplayed part without generating a new reply.")
+            .performScrollTo().assertIsDisplayed()
+        assertEquals(0, switched)
+        compose.onNodeWithText("Use Android TTS · offline voice required").performScrollTo().performClick()
+        assertEquals(1, switched)
+        compose.onNodeWithText("Hello friend!").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun unknownRetryTimeAndReportedQuotaDoNotInventAnAccountAllowance() {
+        var retries = 0
+        val config = com.superbot.sati.ai.PipelineConfig(stt = com.superbot.sati.ai.SttModel.Whisper)
+        compose.setContent {
+            SatiTheme {
+                ConversationScreen(
+                    ConversationState(phase = ConversationPhase.Error,
+                        stageFailure = com.superbot.sati.ai.StageFailure(
+                            com.superbot.sati.ai.PipelineStage.Stt,
+                            com.superbot.sati.ai.CloudProvider.Groq, config.stt.id, ReplyFailure.RateLimit)),
+                    { retries++ }, {}, {}, model = ready, config = config,
+                    groqKeyStatus = ApiKeyStatus(loaded = true, hasKey = true),
+                    quotas = mapOf(config.stt.id to com.superbot.sati.ai.RateLimitSnapshot(
+                        config.stt.id, System.currentTimeMillis(), remainingRequests = 27)),
+                )
+            }
+        }
+        compose.onNodeWithText("Daily requests remaining: 27").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Groq did not report a retry time.").performScrollTo().assertIsDisplayed()
+        assertEquals(0, retries)
+        compose.onNodeWithTag("retry-stage").performScrollTo().performClick()
+        assertEquals(1, retries)
+        compose.onNodeWithText("Daily requests remaining: 2000").assertDoesNotExist()
     }
 
     @Test

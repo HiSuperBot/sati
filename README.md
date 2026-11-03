@@ -1,12 +1,21 @@
 # Sati
 
-A child-friendly Android AI companion that helps Korean-speaking children learn English through conversation, using Android's built-in STT and TTS with simple eye animations.
+A child-friendly Android companion for practicing simple English through voice
+conversation, with animated eyes.
 
-The AI uses simple English by default and offers brief Korean help only when a child is really struggling, then returns to English.
+Choose each stage independently:
 
-Chat is voice-only. Choose Qwen, Gemma, or supported Gemini Nano for on-device
-replies, or choose DeepSeek Flash and connect your own API key for cloud replies.
-DeepSeek sends recognized conversation text to its API and requires internet;
-speech recognition and playback remain on-device.
+- **STT · Listen:** Android on-device recognition or Groq Whisper.
+- **Model · Conversation:** Qwen, Gemma, supported Gemini Nano, DeepSeek Flash,
+  or Groq GPT-OSS 20B/120B.
+- **TTS · Speak:** Android offline voice or Groq Orpheus English with selectable voices.
 
-See [model setup and privacy details](docs/offline.md).
+Sati listens automatically while open and ready, and listens again after replying.
+Use Pause/Resume for a break. Chat has no typing field or Talk button.
+
+Groq uses one securely stored API key across its three stages; DeepSeek uses a
+separate key. Cloud stages require internet and may incur API charges. The UI
+shows which audio/text leaves the device, reported quotas, and explicit recovery
+choices when a stage hits a limit.
+
+See [setup, privacy, and verification](docs/offline.md).

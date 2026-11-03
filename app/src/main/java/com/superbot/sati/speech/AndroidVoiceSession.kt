@@ -49,10 +49,7 @@ class AndroidVoiceSession(context: Context) : VoiceSession {
             Log.w("SatiSpeech", "No on-device recognition service; API=${Build.VERSION.SDK_INT}")
             return callbacks.onError(SpeechProblem.RecognitionUnavailable)
         }
-        ensureSpeechReady(
-            onReady = { if (turn == generation && !closed) beginRecognition(turn, callbacks) },
-            onError = { if (turn == generation && !closed) callbacks.onError(it) },
-        )
+        beginRecognition(turn, callbacks)
     }
 
     private fun beginRecognition(turn: Long, callbacks: ListeningCallbacks) {

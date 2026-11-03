@@ -32,6 +32,8 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -52,6 +54,13 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.superbot.sati.R
 import com.superbot.sati.ai.AiModel
+import com.superbot.sati.ai.CloudProvider
+import com.superbot.sati.ai.PipelineConfig
+import com.superbot.sati.ai.PipelineStage
+import com.superbot.sati.ai.SttModel
+import com.superbot.sati.ai.TtsModel
+import com.superbot.sati.ai.OrpheusVoice
+import com.superbot.sati.ai.RateLimitSnapshot
 import com.superbot.sati.ai.NanoAvailability
 import com.superbot.sati.ai.ApiKeyStatus
 import com.superbot.sati.ai.ApiKeySetupState
@@ -66,8 +75,8 @@ import com.superbot.sati.ui.theme.SatiTheme
 @Composable
 fun ConversationScreen(
     state: ConversationState,
-    onTalk: () -> Unit,
-    onCancel: () -> Unit,
+    onRetry: () -> Unit,
+    onPauseResume: () -> Unit,
     onOpenSettings: () -> Unit,
     model: AiModelState = AiModelState(status = ModelStatus.Missing),
     onCancelDownload: () -> Unit = {},
@@ -83,9 +92,28 @@ fun ConversationScreen(
     onConnectKey: () -> Unit = {},
     onDismissKey: () -> Unit = {},
     onRemoveKey: () -> Unit = {},
+    onDialogVisibilityChanged: (Boolean) -> Unit = {},
+    config: PipelineConfig = PipelineConfig(chat = model.model),
+    groqKeyStatus: ApiKeyStatus = ApiKeyStatus(),
+    quotas: Map<String, RateLimitSnapshot> = emptyMap(),
+    onSelectStt: (SttModel) -> Unit = {},
+    onSelectTts: (TtsModel) -> Unit = {},
+    onSelectVoice: (OrpheusVoice) -> Unit = {},
+    onGroqKey: () -> Unit = {},
+    onRemoveGroqKey: () -> Unit = {},
+    onUseDevice: (PipelineStage) -> Unit = {},
+    androidInputAvailable: Boolean = true,
 ) {
-    val ready = model.status == ModelStatus.Ready
+    val ready = model.status == ModelStatus.Ready && (!config.usesGroq || groqKeyStatus.hasKey)
+    val canChange = !state.isActive || state.phase == ConversationPhase.Listening
+    var showSpeech by rememberSaveable { mutableStateOf<String?>(null) }
     var showModels by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(showModels, showSpeech, keySetup.isOpen) {
+        onDialogVisibilityChanged(showModels || showSpeech != null || keySetup.isOpen)
+    }
+    DisposableEffect(Unit) {
+        onDispose { onDialogVisibilityChanged(false) }
+    }
 
     Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
         Box(
@@ -106,45 +134,83 @@ fun ConversationScreen(
                     style = MaterialTheme.typography.bodyLarge,
                 )
                 SatiEyes(state.phase)
-                ModelCard(
-                    model, onCancelDownload, onRetryModel,
-                    canChangeModel = !state.isActive,
-                    onChangeModel = { showModels = true },
-                    keyStatus = keyStatus, onEditKey = onEditKey, onRemoveKey = onRemoveKey,
-                )
+                state.stageFailure?.let { failure ->
+                    FailureRecoveryCard(
+                        failure, onRetry,
+                        onChoose = {
+                            onDialogVisibilityChanged(true)
+                            if (failure.stage == PipelineStage.Chat) showModels = true
+                            else showSpeech = failure.stage.name
+                        },
+                        onDevice = { onUseDevice(failure.stage) },
+                        onKey = if (failure.provider == CloudProvider.Groq) onGroqKey else onEditKey,
+                        deviceAvailable = failure.stage != PipelineStage.Stt || androidInputAvailable,
+                        canRetry = ready && !state.isPaused,
+                    )
+                }
                 Text(
                     text = stringResource(
-                        if (ready || state.problem != null || state.replyFailure != null) state.statusResource()
+                        if (ready || state.problem != null || state.replyFailure != null || state.stageFailure != null) state.statusResource()
+                        else if (config.usesGroq && !groqKeyStatus.hasKey) R.string.groq_key_required
                         else if (model.model.isCloud) R.string.api_key_required
                         else R.string.offline_setup_required,
                     ),
                     modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
                     style = MaterialTheme.typography.titleMedium,
                     textAlign = TextAlign.Center,
-                    color = if (state.problem != null || state.replyFailure != null) MaterialTheme.colorScheme.error
+                    color = if (state.problem != null || state.replyFailure != null || state.stageFailure != null) MaterialTheme.colorScheme.error
                         else MaterialTheme.colorScheme.onSurface,
                 )
                 val needsSettings = state.problem == SpeechProblem.PermissionSettings
+                val needsPermission = state.problem == SpeechProblem.PermissionDenied
                 Button(
                     onClick = when {
-                        state.isActive -> onCancel
                         needsSettings -> onOpenSettings
-                        else -> onTalk
+                        needsPermission -> onRetry
+                        state.isPaused || state.stageFailure != null -> onPauseResume
+                        state.phase == ConversationPhase.Error -> onRetry
+                        else -> onPauseResume
                     },
-                    enabled = state.isActive || ready,
+                    enabled = ready || state.isActive || state.isPaused || needsSettings || needsPermission,
                     modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp),
                     contentPadding = PaddingValues(16.dp),
                 ) {
                     Text(
                         stringResource(when {
-                            state.isActive -> R.string.cancel
                             needsSettings -> R.string.open_settings
+                            needsPermission -> R.string.allow_microphone
+                            state.isPaused -> R.string.resume_listening
+                            state.stageFailure != null -> R.string.pause_listening
                             state.phase == ConversationPhase.Error -> R.string.try_again
-                            else -> R.string.talk
+                            else -> R.string.pause_listening
                         }),
                         style = MaterialTheme.typography.titleLarge,
                     )
                 }
+                SpeechSelectionCard(
+                    PipelineStage.Stt, config.stt.label, config.stt.isCloud, groqKeyStatus,
+                    quotas[config.stt.id],
+                    onChange = { onDialogVisibilityChanged(true); showSpeech = "Stt" },
+                    onKey = onGroqKey, onRemoveKey = onRemoveGroqKey, canChange = canChange,
+                )
+                ModelCard(
+                    model, onCancelDownload, onRetryModel,
+                    canChangeModel = !state.isActive || state.phase == ConversationPhase.Listening,
+                    onChangeModel = {
+                        onDialogVisibilityChanged(true)
+                        showModels = true
+                    },
+                    keyStatus = keyStatus, onEditKey = onEditKey, onRemoveKey = onRemoveKey,
+                )
+                if (model.model.provider == CloudProvider.Groq) QuotaStatus(quotas[model.model.id])
+                SpeechSelectionCard(
+                    PipelineStage.Tts, config.tts.label, config.tts.isCloud, groqKeyStatus,
+                    quotas[config.tts.id],
+                    onChange = { onDialogVisibilityChanged(true); showSpeech = "Tts" },
+                    onKey = onGroqKey, onRemoveKey = onRemoveGroqKey, canChange = canChange,
+                    voice = if (config.tts.isCloud) config.voice else null,
+                    onVoice = { onDialogVisibilityChanged(true); showSpeech = "Voice" },
+                )
                 if (state.transcript.isNotEmpty()) {
                     ConversationCard(stringResource(R.string.you_said), state.transcript)
                 }
@@ -153,35 +219,77 @@ fun ConversationScreen(
                 }
                 TextButton(
                     onClick = onNewConversation,
-                    enabled = ready && !state.isActive,
+                    enabled = ready,
                 ) { Text(stringResource(R.string.start_over)) }
                 Text(
                     stringResource(R.string.turn_hint),
                     style = MaterialTheme.typography.bodyMedium,
                     textAlign = TextAlign.Center,
                 )
-                Text(
-                    stringResource(if (model.model.isCloud) R.string.deepseek_privacy
-                        else R.string.offline_privacy),
-                    style = MaterialTheme.typography.bodySmall,
-                    textAlign = TextAlign.Center,
-                )
+                PipelinePrivacy(config)
             }
         }
     }
     if (keySetup.isOpen) {
         ApiKeySetupDialog(keySetup, onKeyDraftChange, onConnectKey, onDismissKey)
     }
+
+    if (showSpeech != null) {
+        val selection = showSpeech
+        val choices = when (selection) {
+            "Stt" -> SttModel.entries.map {
+                SpeechChoice(it.id, it.label,
+                    stringResource(if (it.isCloud) R.string.groq_stt_description else R.string.android_stt_description),
+                    it.isCloud || androidInputAvailable)
+            }
+            "Tts" -> TtsModel.entries.map {
+                SpeechChoice(it.id, it.label,
+                    stringResource(if (it.isCloud) R.string.groq_tts_description else R.string.android_tts_description))
+            }
+            else -> OrpheusVoice.entries.map { SpeechChoice(it.id, it.label, "") }
+        }
+        SpeechChooser(
+            title = stringResource(when (selection) {
+                "Stt" -> R.string.choose_stt
+                "Tts" -> R.string.choose_tts
+                else -> R.string.choose_voice
+            }),
+            choices = choices,
+            selected = when (selection) {
+                "Stt" -> config.stt.id
+                "Tts" -> config.tts.id
+                else -> config.voice.id
+            },
+            onChoose = {
+                when (selection) {
+                    "Stt" -> onSelectStt(SttModel.fromId(it))
+                    "Tts" -> onSelectTts(TtsModel.fromId(it))
+                    else -> onSelectVoice(OrpheusVoice.fromId(it))
+                }
+                showSpeech = null
+                onDialogVisibilityChanged(keySetup.isOpen)
+            },
+            onDismiss = {
+                showSpeech = null
+                onDialogVisibilityChanged(keySetup.isOpen)
+            },
+        )
+    }
+
     if (showModels) {
         ModelChooser(
             selected = model.model,
             nanoAvailability = nanoAvailability,
             onSelect = {
-                showModels = false
                 onSelectModel(it)
+                showModels = false
+                onDialogVisibilityChanged(keySetup.isOpen)
             },
             onCheckNano = onCheckNano,
-            onDismiss = { showModels = false },
+            onDismiss = {
+                showModels = false
+                onDialogVisibilityChanged(keySetup.isOpen)
+            },
         )
     }
 }
@@ -217,6 +325,7 @@ private fun ModelChooser(
                                     AiModel.Gemma -> R.string.gemma_description
                                     AiModel.GeminiNano -> nanoAvailability.descriptionResource()
                                     AiModel.DeepSeek -> R.string.deepseek_description
+                                    AiModel.Groq20, AiModel.Groq120 -> R.string.groq_description
                                 }),
                                 style = MaterialTheme.typography.bodySmall,
                             )
@@ -252,6 +361,7 @@ private fun setupDescription(model: AiModel): String = stringResource(
         AiModel.Gemma -> R.string.gemma_description
         AiModel.GeminiNano -> R.string.nano_downloadable
         AiModel.DeepSeek -> R.string.deepseek_description
+        AiModel.Groq20, AiModel.Groq120 -> R.string.groq_description
     },
 )
 
@@ -268,6 +378,7 @@ private fun ModelCard(
 ) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(stringResource(R.string.model_heading), style = MaterialTheme.typography.titleMedium)
             Text(state.model.displayName, style = MaterialTheme.typography.titleMedium)
             Text(stringResource(if (state.model.isCloud) R.string.cloud_mode else R.string.on_device_mode),
                 style = MaterialTheme.typography.labelMedium)
@@ -276,9 +387,12 @@ private fun ModelCard(
             }
             if (state.model.isCloud) {
                 Text(stringResource(when (state.status) {
-                    ModelStatus.Ready -> R.string.cloud_ready
-                    ModelStatus.Loading -> R.string.cloud_preparing
-                    else -> R.string.api_key_required
+                    ModelStatus.Ready -> if (state.model.provider == CloudProvider.Groq)
+                        R.string.groq_key_connected else R.string.cloud_ready
+                    ModelStatus.Loading -> if (state.model.provider == CloudProvider.Groq)
+                        R.string.groq_preparing else R.string.cloud_preparing
+                    else -> if (state.model.provider == CloudProvider.Groq)
+                        R.string.groq_key_required else R.string.api_key_required
                 }), style = MaterialTheme.typography.titleSmall)
                 if (state.problem == ModelProblem.CredentialStorage) {
                     Text(stringResource(R.string.error_key_storage))
@@ -396,7 +510,8 @@ private fun SatiEyes(phase: ConversationPhase) {
     }
 }
 
-private fun ConversationState.statusResource(): Int = replyFailure?.messageResource() ?: when (problem) {
+private fun ConversationState.statusResource(): Int = if (isPaused) R.string.status_paused
+    else stageFailure?.messageResource() ?: replyFailure?.messageResource() ?: when (problem) {
     SpeechProblem.PermissionDenied -> R.string.error_permission
     SpeechProblem.PermissionSettings -> R.string.error_permission_settings
     SpeechProblem.RecognitionUnavailable -> R.string.error_recognition_unavailable

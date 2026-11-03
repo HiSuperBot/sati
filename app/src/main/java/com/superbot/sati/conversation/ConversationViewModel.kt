@@ -1,7 +1,11 @@
 package com.superbot.sati.conversation
 
+import android.os.Handler
+import android.os.Looper
 import androidx.lifecycle.ViewModel
 import com.superbot.sati.ai.ReplyFailure
+import com.superbot.sati.ai.StageFailure
+import com.superbot.sati.ai.PipelineStage
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
@@ -21,6 +25,8 @@ data class ConversationState(
     val problem: SpeechProblem? = null,
     val isGenerating: Boolean = false,
     val replyFailure: ReplyFailure? = null,
+    val isPaused: Boolean = false,
+    val stageFailure: StageFailure? = null,
 ) {
     val isActive: Boolean
         get() = phase in setOf(
@@ -35,11 +41,18 @@ data class ListeningCallbacks(
     val onResult: (String) -> Unit,
     val onError: (SpeechProblem) -> Unit,
     val onPreparing: () -> Unit = {},
+    val onStageError: (StageFailure) -> Unit = { onError(SpeechProblem.Network) },
 )
 
 interface VoiceSession {
     fun listen(callbacks: ListeningCallbacks)
+    fun retryListen(callbacks: ListeningCallbacks) = listen(callbacks)
     fun speak(text: String, onDone: () -> Unit, onError: (SpeechProblem) -> Unit)
+    fun speakWithFailure(
+        text: String, onDone: () -> Unit, onError: (SpeechProblem) -> Unit,
+        onStageError: (StageFailure) -> Unit,
+    ) = speak(text, onDone, onError)
+    fun remainingSpeech(original: String): String = original
     fun cancel()
 }
 
@@ -47,6 +60,7 @@ data class ReplyCallbacks(
     val onPartial: (String) -> Unit,
     val onComplete: (String) -> Unit,
     val onError: (ReplyFailure) -> Unit,
+    val onStageError: (StageFailure) -> Unit = { onError(it.reason) },
 )
 
 interface ReplyGenerator {
@@ -56,25 +70,126 @@ interface ReplyGenerator {
     fun reset()
 }
 
-class ConversationViewModel : ViewModel() {
+class ConversationViewModel(
+    private val scheduler: ListeningScheduler = MainListeningScheduler(),
+) : ViewModel() {
     private val mutableState = MutableStateFlow(ConversationState())
     val state = mutableState.asStateFlow()
     private var generation = 0L
     private var session: VoiceSession? = null
     private var generator: ReplyGenerator? = null
     private var backend: String? = null
+    private var availableVoice: VoiceSession? = null
+    private var availableReplies: ReplyGenerator? = null
+    private var cancelRestart: (() -> Unit)? = null
+    private var recoveryVoice: VoiceSession? = null
+    private var retryInput: String? = null
+    private var retrySpeech: String? = null
+    private var speechIdentity: Pair<String, String>? = null
+    private var retryAfterSpeechChange = false
+
+    /** The activity supplies only a resumed, focused, permitted, ready backend. */
+    fun updateAvailability(voice: VoiceSession, replies: ReplyGenerator, available: Boolean) {
+        if (!available) {
+            availableVoice = null
+            availableReplies = null
+            cancelConversation()
+            return
+        }
+        availableVoice = voice
+        availableReplies = replies
+        if (retryAfterSpeechChange) retryListening() else listenWhenReady()
+    }
+
+    fun pauseListening() {
+        retryAfterSpeechChange = false
+        mutableState.value = state.value.copy(isPaused = true)
+        cancelConversation()
+    }
+
+    fun resumeListening() {
+        if (!state.value.isPaused) return
+        mutableState.value = state.value.copy(isPaused = false)
+        retryListening()
+    }
+
+    fun retryListening() {
+        if (state.value.isActive || state.value.isPaused) return
+        val failure = state.value.stageFailure
+        if (failure != null) {
+            if (failure.remainingSeconds(System.currentTimeMillis()) > 0) return
+            val voice = availableVoice ?: return
+            val replies = availableReplies ?: return
+            recoveryVoice = null
+            when (failure.stage) {
+                PipelineStage.Stt -> startListening(voice, replies, retry = true)
+                PipelineStage.Chat -> {
+                    val turn = beginTurn(voice, replies) ?: return
+                    generateReply(turn, retryInput ?: state.value.transcript, voice, replies)
+                }
+                PipelineStage.Tts -> {
+                    val turn = beginTurn(voice, replies) ?: return
+                    playReply(turn, retrySpeech ?: state.value.reply, voice)
+                }
+            }
+        } else {
+            mutableState.value = state.value.copy(
+                phase = ConversationPhase.Idle, problem = null, replyFailure = null,
+            )
+            listenWhenReady()
+        }
+    }
+
+    fun speechConfigurationChanged(stt: String, tts: String) {
+        val previous = speechIdentity
+        speechIdentity = stt to tts
+        if (previous == null) return
+        val failure = state.value.stageFailure ?: return
+        if (failure.stage == PipelineStage.Chat ||
+            (failure.stage == PipelineStage.Stt && previous.first == stt) ||
+            (failure.stage == PipelineStage.Tts && previous.second == tts)
+        ) return
+        retryAfterSpeechChange = true
+        mutableState.value = state.value.copy(stageFailure = failure.copy(retryAtMillis = null))
+        retryListening()
+    }
+
+    private fun listenWhenReady() {
+        val voice = availableVoice ?: return
+        val replies = availableReplies ?: return
+        if (state.value.isPaused || state.value.phase != ConversationPhase.Idle ||
+            cancelRestart != null || !replies.isReady
+        ) return
+        startConversation(voice, replies)
+    }
+
+    private fun scheduleListening(delayMillis: Long) {
+        if (availableVoice == null || state.value.isPaused) return
+        cancelRestart?.invoke()
+        val token = generation
+        cancelRestart = scheduler.schedule(delayMillis) {
+            if (token == generation) {
+                cancelRestart = null
+                listenWhenReady()
+            }
+        }
+    }
 
     fun bindBackend(identity: String, replies: ReplyGenerator) {
         if (backend != null && backend != identity) newConversation(replies)
         backend = identity
     }
 
-    fun startConversation(voice: VoiceSession, replies: ReplyGenerator) {
+    fun startConversation(voice: VoiceSession, replies: ReplyGenerator) =
+        startListening(voice, replies, retry = false)
+
+    private fun startListening(voice: VoiceSession, replies: ReplyGenerator, retry: Boolean) {
+        cancelRestart?.invoke()
+        cancelRestart = null
         val turn = beginTurn(voice, replies) ?: return
         var acceptedResult = false
         fun acceptsInput() = turn == generation && !acceptedResult && state.value.isActive
-        voice.listen(
-            ListeningCallbacks(
+        val callbacks = ListeningCallbacks(
                 onPreparing = {
                     if (acceptsInput()) {
                         mutableState.value = state.value.copy(phase = ConversationPhase.PreparingSpeech)
@@ -97,8 +212,9 @@ class ConversationViewModel : ViewModel() {
                     }
                 },
                 onError = { problem -> if (acceptsInput()) fail(problem) },
-            ),
-        )
+                onStageError = { if (acceptsInput()) failStage(it) },
+            )
+        if (retry) voice.retryListen(callbacks) else voice.listen(callbacks)
     }
 
     private fun beginTurn(voice: VoiceSession, replies: ReplyGenerator): Long? {
@@ -108,10 +224,11 @@ class ConversationViewModel : ViewModel() {
             return null
         }
         val turn = ++generation
+        retryAfterSpeechChange = false
         session = voice
         generator = replies
         mutableState.value = state.value.copy(
-            phase = ConversationPhase.Processing, problem = null, replyFailure = null,
+            phase = ConversationPhase.Processing, problem = null, replyFailure = null, stageFailure = null,
         )
         return turn
     }
@@ -123,6 +240,7 @@ class ConversationViewModel : ViewModel() {
         replies: ReplyGenerator,
     ) {
         val input = text.trim()
+        retryInput = input
         if (input.isEmpty()) return fail(SpeechProblem.NoSpeech)
         if (input.length > MAX_INPUT_LENGTH) return fail(SpeechProblem.InputTooLong)
         mutableState.value = state.value.copy(
@@ -147,35 +265,60 @@ class ConversationViewModel : ViewModel() {
                             mutableState.value = state.value.copy(
                                 phase = ConversationPhase.Speaking, reply = reply, isGenerating = false,
                             )
-                            voice.speak(
-                                reply,
-                                onDone = {
-                                    if (turn == generation &&
-                                        state.value.phase == ConversationPhase.Speaking
-                                    ) {
-                                        session = null
-                                        generator = null
-                                        mutableState.value = state.value.copy(phase = ConversationPhase.Idle)
-                                    }
-                                },
-                                onError = { problem ->
-                                    if (turn == generation &&
-                                        state.value.phase == ConversationPhase.Speaking
-                                    ) fail(problem)
-                                },
-                            )
+                            playReply(turn, reply, voice)
                         }
                     }
                 },
                 onError = { if (acceptsReply()) failReply(it) },
+                onStageError = { if (acceptsReply()) failStage(it) },
             ),
+        )
+    }
+
+
+    private fun playReply(turn: Long, text: String, voice: VoiceSession) {
+        mutableState.value = state.value.copy(
+            phase = ConversationPhase.Speaking, isGenerating = false, stageFailure = null,
+        )
+        fun acceptsPlayback() = turn == generation && state.value.phase == ConversationPhase.Speaking
+        voice.speakWithFailure(
+            text,
+            onDone = {
+                if (acceptsPlayback()) {
+                    session = null
+                    generator = null
+                    retrySpeech = null
+                    mutableState.value = state.value.copy(phase = ConversationPhase.Idle)
+                    scheduleListening(500L)
+                }
+            },
+            onError = { if (acceptsPlayback()) fail(it) },
+            onStageError = { if (acceptsPlayback()) failStage(it) },
+        )
+    }
+
+    private fun failStage(failure: StageFailure) {
+        val failedVoice = session
+        if (failure.stage == PipelineStage.Tts) {
+            retrySpeech = failedVoice?.remainingSpeech(state.value.reply) ?: state.value.reply
+        }
+        val reply = if (state.value.isGenerating) "" else state.value.reply
+        invalidateSession(cancelVoice = false)
+        recoveryVoice = failedVoice
+        mutableState.value = state.value.copy(
+            phase = ConversationPhase.Error, isGenerating = false, reply = reply,
+            problem = null, replyFailure = null, stageFailure = failure,
         )
     }
 
     fun newConversation(replies: ReplyGenerator) {
         invalidateSession()
+        retryInput = null
+        retrySpeech = null
+        retryAfterSpeechChange = false
         replies.reset()
-        mutableState.value = ConversationState()
+        mutableState.value = ConversationState(isPaused = state.value.isPaused)
+        scheduleListening(0L)
     }
 
     private fun failReply(failure: ReplyFailure) {
@@ -190,7 +333,19 @@ class ConversationViewModel : ViewModel() {
     fun showProblem(problem: SpeechProblem) = fail(problem)
 
     fun cancelConversation() {
-        if (!state.value.isActive) return
+        recoveryVoice?.cancel()
+        recoveryVoice = null
+        if (state.value.stageFailure?.stage == PipelineStage.Stt) {
+            mutableState.value = state.value.copy(
+                stageFailure = state.value.stageFailure?.copy(recordingExpired = true),
+            )
+        }
+        cancelRestart?.invoke()
+        cancelRestart = null
+        if (!state.value.isActive) {
+            generation++
+            return
+        }
         val reply = if (state.value.isGenerating) "" else state.value.reply
         invalidateSession()
         mutableState.value = state.value.copy(
@@ -209,6 +364,15 @@ class ConversationViewModel : ViewModel() {
     }
 
     private fun fail(problem: SpeechProblem) {
+        if (problem == SpeechProblem.NoSpeech && availableVoice != null && !state.value.isPaused) {
+            invalidateSession()
+            mutableState.value = state.value.copy(
+                phase = ConversationPhase.Idle, problem = null, replyFailure = null,
+                isGenerating = false,
+            )
+            scheduleListening(1_000L)
+            return
+        }
         val reply = if (state.value.isGenerating) "" else state.value.reply
         invalidateSession()
         mutableState.value = state.value.copy(
@@ -217,19 +381,44 @@ class ConversationViewModel : ViewModel() {
         )
     }
 
-    private fun invalidateSession() {
+    private fun invalidateSession(cancelVoice: Boolean = true) {
+        if (cancelVoice) {
+            recoveryVoice?.cancel()
+            recoveryVoice = null
+        }
+        cancelRestart?.invoke()
+        cancelRestart = null
         generation++
         val previousSession = session
         val previousGenerator = generator
         session = null
         generator = null
-        previousSession?.cancel()
+        if (cancelVoice) previousSession?.cancel()
         previousGenerator?.cancel()
     }
 
-    override fun onCleared() = invalidateSession()
+    override fun onCleared() {
+        availableVoice = null
+        availableReplies = null
+        invalidateSession()
+    }
 
     companion object {
         const val MAX_INPUT_LENGTH = 240
+    }
+}
+
+/** Schedules one restart without blocking the speech callback stack. */
+fun interface ListeningScheduler {
+    fun schedule(delayMillis: Long, action: () -> Unit): () -> Unit
+}
+
+private class MainListeningScheduler : ListeningScheduler {
+    private val handler by lazy { Handler(Looper.getMainLooper()) }
+
+    override fun schedule(delayMillis: Long, action: () -> Unit): () -> Unit {
+        val task = Runnable(action)
+        handler.postDelayed(task, delayMillis)
+        return { handler.removeCallbacks(task) }
     }
 }

@@ -33,6 +33,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -62,36 +64,82 @@ class AiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerator {
     private val main = Handler(Looper.getMainLooper())
     private val keyScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val deepSeek = DeepSeekClient()
+    private val mutableQuotas = MutableStateFlow<Map<String, RateLimitSnapshot>>(emptyMap())
+    val quotas = mutableQuotas.asStateFlow()
+    internal val groq = GroqClient(onQuota = { quota ->
+        mutableQuotas.update { it + (quota.modelId to quota) }
+    })
+    private var pendingApply: (() -> Unit)? = null
+    private var keyProvider = CloudProvider.DeepSeek
     private val keys = DeepSeekKeySetup(
         keyScope, AndroidApiKeyStore(app), deepSeek,
-        onConnected = { activateModel(AiModel.DeepSeek, force = true) },
+        onConnected = { credentialConnected(CloudProvider.DeepSeek) },
     )
-    val keySetup = keys.state
+    private val groqKeys = DeepSeekKeySetup(
+        keyScope,
+        AndroidApiKeyStore(app, File(app.noBackupFilesDir, "credentials/groq.key"), "sati.groq.api_key"),
+        groq, onConnected = { credentialConnected(CloudProvider.Groq) }, provider = CloudProvider.Groq,
+    )
+    private val mutableKeySetup = MutableStateFlow(ApiKeySetupState())
+    val keySetup = mutableKeySetup.asStateFlow()
     val keyStatus = keys.status
+    val groqKeyStatus = groqKeys.status
 
-    fun openKeySetup() = keys.open()
-    fun editApiKey(draft: String) = keys.edit(draft.take(4097))
-    fun connectApiKey() = keys.connect()
-    fun dismissKeySetup() = keys.dismiss()
-    fun pauseKeyValidation() = keys.pauseValidation()
+    private fun credentials(provider: CloudProvider) =
+        if (provider == CloudProvider.Groq) groqKeys else keys
+    internal fun groqKey(): String? = groqKeys.key()
 
-    fun removeApiKey() {
+    fun openKeySetup(provider: CloudProvider = CloudProvider.DeepSeek) {
+        pendingApply = null
+        keys.dismiss()
+        groqKeys.dismiss()
+        keyProvider = provider
+        credentials(provider).open()
+        mutableKeySetup.value = credentials(provider).state.value
+    }
+    fun editApiKey(draft: String) = credentials(keyProvider).edit(draft.take(4097))
+    fun connectApiKey() = credentials(keyProvider).connect()
+    fun dismissKeySetup() {
+        pendingApply = null
+        keys.dismiss()
+        groqKeys.dismiss()
+        mutableKeySetup.value = ApiKeySetupState(provider = keyProvider)
+    }
+    fun pauseKeyValidation() {
+        keys.pauseValidation()
+        groqKeys.pauseValidation()
+    }
+    private fun credentialConnected(provider: CloudProvider) {
+        val apply = pendingApply
+        pendingApply = null
+        if (apply != null) apply()
+        else if (state.value.model.provider == provider) activateModel(state.value.model, force = true)
+    }
+    private fun withKey(provider: CloudProvider, apply: () -> Unit) {
+        if (credentials(provider).key() != null) apply()
+        else {
+            openKeySetup(provider)
+            pendingApply = apply
+        }
+    }
+    fun removeApiKey(provider: CloudProvider = CloudProvider.DeepSeek) {
         if (disposed.get()) return
         cancel()
-        keys.dismiss()
-        if (state.value.model == AiModel.DeepSeek) {
+        dismissKeySetup()
+        if (state.value.model.provider == provider) {
             setupRequest.incrementAndGet()
             setupJob?.cancel()
             memory.clear()
             mutableState.value = state.value.copy(status = ModelStatus.NeedsApiKey, problem = null)
         }
         keyScope.launch {
-            try {
-                keys.remove()
-            } catch (_: CancellationException) {
-                // ViewModel disposal.
-            } catch (_: Exception) {
-                if (state.value.model == AiModel.DeepSeek) modelFailed(ModelProblem.CredentialStorage)
+            try { credentials(provider).remove() }
+            catch (_: CancellationException) { /* ViewModel disposal. */ }
+            catch (_: Exception) {
+                credentials(provider).reportStorageFailure()
+                keyProvider = provider
+                mutableKeySetup.value = credentials(provider).state.value
+                if (state.value.model.provider == provider) modelFailed(ModelProblem.CredentialStorage)
             }
         }
     }
@@ -103,6 +151,13 @@ class AiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerator {
     private val mutableState = MutableStateFlow(AiModelState(
         model = AiModel.fromId(preferences.getString("selected_model", null)),
     ))
+    private val mutableConfig = MutableStateFlow(PipelineConfig(
+        stt = SttModel.fromId(preferences.getString("selected_stt", null)),
+        chat = mutableState.value.model,
+        tts = TtsModel.fromId(preferences.getString("selected_tts", null)),
+        voice = OrpheusVoice.fromId(preferences.getString("selected_voice", null)),
+    ))
+    val config = mutableConfig.asStateFlow()
     private val mutableNanoAvailability = MutableStateFlow(NanoAvailability.Checking)
     val nanoAvailability = mutableNanoAvailability.asStateFlow()
     private var nano: NanoModel? = null
@@ -119,6 +174,11 @@ class AiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerator {
         get() = !disposed.get() && state.value.status == ModelStatus.Ready
 
     init {
+        keyScope.launch {
+            combine(keys.state, groqKeys.state) { deep, groq ->
+                if (keyProvider == CloudProvider.Groq) groq else deep
+            }.collect { mutableKeySetup.value = it }
+        }
         refreshNanoAvailability()
         beginSetup()
     }
@@ -143,14 +203,37 @@ class AiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerator {
 
     fun selectModel(model: AiModel) {
         if (disposed.get()) return
-        if (model == AiModel.DeepSeek && !keyStatus.value.hasKey) {
-            keys.open()
-            return
+        val provider = model.provider
+        if (provider != null) withKey(provider) { activateModel(model) }
+        else {
+            dismissKeySetup()
+            activateModel(model)
         }
-        keys.dismiss()
-        activateModel(model)
     }
 
+    fun selectStt(model: SttModel) {
+        val apply = {
+            preferences.edit().putString("selected_stt", model.id).apply()
+            mutableConfig.value = config.value.copy(stt = model)
+        }
+        if (model.isCloud) withKey(CloudProvider.Groq, apply) else apply()
+    }
+
+    fun selectTts(model: TtsModel) {
+        val apply = {
+            preferences.edit().putString("selected_tts", model.id).apply()
+            mutableConfig.value = config.value.copy(tts = model)
+        }
+        if (model.isCloud) withKey(CloudProvider.Groq, apply) else apply()
+    }
+
+    fun selectVoice(voice: OrpheusVoice) {
+        preferences.edit().putString("selected_voice", voice.id).apply()
+        mutableConfig.value = config.value.copy(voice = voice)
+    }
+
+    val pipelineReady: Boolean
+        get() = isReady && (!config.value.usesGroq || groqKeyStatus.value.hasKey)
     private fun activateModel(model: AiModel, force: Boolean = false) {
         if (disposed.get() || (!force && model == state.value.model)) return
         if (model == AiModel.GeminiNano && !nanoAvailability.value.canSelect) return
@@ -158,6 +241,7 @@ class AiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerator {
         setupJob?.cancel()
         memory.clear()
         preferences.edit().putString("selected_model", model.id).apply()
+        mutableConfig.value = config.value.copy(chat = model)
         mutableState.value = AiModelState(model = model)
         beginSetup()
     }
@@ -185,13 +269,14 @@ class AiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerator {
             mutex.withLock {
                 stopGeneration()
                 try {
-                    if (selected == AiModel.DeepSeek) {
+                    if (selected.isCloud) {
                         releaseEngine()
-                        keys.awaitLoaded()
+                        val credentials = credentials(checkNotNull(selected.provider))
+                        credentials.awaitLoaded()
                         currentCoroutineContext().ensureActive()
                         if (setup != setupRequest.get()) return@withLock
                         mutableState.value = state.value.copy(
-                            status = if (keys.key() != null) ModelStatus.Ready else ModelStatus.NeedsApiKey,
+                            status = if (credentials.key() != null) ModelStatus.Ready else ModelStatus.NeedsApiKey,
                             problem = null,
                         )
                         return@withLock
@@ -324,6 +409,15 @@ class AiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerator {
                             val partial = response.toString()
                             deliver(request) { callbacks.onPartial(partial) }
                         }
+                    } else if (state.value.model.provider == CloudProvider.Groq) {
+                        val key = groqKeys.key() ?: throw StageException(StageFailure(
+                            PipelineStage.Chat, CloudProvider.Groq, state.value.model.id, ReplyFailure.Authentication,
+                        ))
+                        groq.stream(key, state.value.model, text, memory.snapshot()).collect { delta ->
+                            response.append(delta)
+                            val partial = response.toString()
+                            deliver(request) { callbacks.onPartial(partial) }
+                        }
                     } else if (state.value.model == AiModel.GeminiNano) {
                         val reply = nanoClient().generate(text, memory.snapshot()) { partial ->
                             deliver(request) { callbacks.onPartial(partial) }
@@ -354,6 +448,10 @@ class AiViewModel(app: Application) : AndroidViewModel(app), ReplyGenerator {
                 ) }
             } catch (canceled: CancellationException) {
                 throw canceled
+            } catch (failure: StageException) {
+                if (request == requestId.get()) {
+                    deliver(request) { callbacks.onStageError(failure.failure) }
+                }
             } catch (failure: ReplyException) {
                 if (request == requestId.get()) {
                     if (failure.failure == ReplyFailure.Authentication) {

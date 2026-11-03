@@ -38,6 +38,7 @@ android {
 
 dependencies {
     implementation(libs.okhttp)
+    implementation(libs.webrtc.vad)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.google.litert.lm)
     implementation(libs.google.genai.prompt)

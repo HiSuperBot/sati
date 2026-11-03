@@ -5,9 +5,16 @@ enum class AiModel(val id: String, val displayName: String) {
     Qwen("qwen3-0.6b", "Qwen3 0.6B"),
     Gemma("gemma4-e2b", "Gemma 4 E2B"),
     GeminiNano("gemini-nano", "Gemini Nano"),
-    DeepSeek("deepseek-flash", "DeepSeek Flash");
+    DeepSeek("deepseek-flash", "DeepSeek Flash"),
+    Groq20("openai/gpt-oss-20b", "Groq GPT-OSS 20B"),
+    Groq120("openai/gpt-oss-120b", "Groq GPT-OSS 120B");
 
-    val isCloud: Boolean get() = this == DeepSeek
+    val provider: CloudProvider? get() = when (this) {
+        DeepSeek -> CloudProvider.DeepSeek
+        Groq20, Groq120 -> CloudProvider.Groq
+        else -> null
+    }
+    val isCloud: Boolean get() = provider != null
 
     val downloadBytes: Long get() = spec?.bytes ?: 0L
 
@@ -21,7 +28,7 @@ enum class AiModel(val id: String, val displayName: String) {
                 bytes = 2_588_147_712L,
                 sha256 = "181938105e0eefd105961417e8da75903eacda102c4fce9ce90f50b97139a63c",
             )
-            GeminiNano, DeepSeek -> null // Managed by AICore or accessed via the cloud API.
+            GeminiNano, DeepSeek, Groq20, Groq120 -> null // Managed by AICore or accessed via the cloud API.
         }
 
     companion object {

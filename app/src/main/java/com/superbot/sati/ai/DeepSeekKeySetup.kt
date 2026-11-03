@@ -23,6 +23,8 @@ data class ApiKeySetupState(
     val isValidating: Boolean = false,
     val invalidInput: Boolean = false,
     val failure: ReplyFailure? = null,
+    val provider: CloudProvider = CloudProvider.DeepSeek,
+    val stageFailure: StageFailure? = null,
 ) {
     override fun toString() =
         "ApiKeySetupState(open=$isOpen, validating=$isValidating, failure=$failure, draft=[redacted])"
@@ -32,10 +34,11 @@ data class ApiKeySetupState(
 internal class DeepSeekKeySetup(
     private val scope: CoroutineScope,
     private val store: ApiKeyStore,
-    private val client: DeepSeekService,
+    private val client: ApiKeyValidator,
+    private val provider: CloudProvider = CloudProvider.DeepSeek,
     private val onConnected: () -> Unit,
 ) {
-    private val mutableState = MutableStateFlow(ApiKeySetupState())
+    private val mutableState = MutableStateFlow(ApiKeySetupState(provider = provider))
     val state = mutableState.asStateFlow()
     private val mutableStatus = MutableStateFlow(ApiKeyStatus())
     val status = mutableStatus.asStateFlow()
@@ -53,12 +56,12 @@ internal class DeepSeekKeySetup(
 
     fun open() {
         dismiss()
-        mutableState.value = ApiKeySetupState(isOpen = true)
+        mutableState.value = ApiKeySetupState(isOpen = true, provider = provider)
     }
 
     fun edit(draft: String) {
         if (!state.value.isOpen || state.value.isValidating) return
-        mutableState.value = state.value.copy(draft = draft, invalidInput = false, failure = null)
+        mutableState.value = state.value.copy(draft = draft, invalidInput = false, failure = null, stageFailure = null)
     }
 
     fun pauseValidation() {
@@ -69,11 +72,13 @@ internal class DeepSeekKeySetup(
 
     fun dismiss() {
         pauseValidation()
-        mutableState.value = ApiKeySetupState()
+        mutableState.value = ApiKeySetupState(provider = provider)
     }
 
     fun connect() {
-        if (!state.value.isOpen || state.value.isValidating) return
+        if (!state.value.isOpen || state.value.isValidating ||
+            (state.value.stageFailure?.remainingSeconds(System.currentTimeMillis()) ?: 0) > 0
+        ) return
         val key = state.value.draft.trim()
         if (!validApiKey(key)) {
             mutableState.value = state.value.copy(invalidInput = true)
@@ -113,10 +118,14 @@ internal class DeepSeekKeySetup(
                         throw ReplyException(ReplyFailure.Storage)
                     }
                 }
-                mutableState.value = ApiKeySetupState()
+                mutableState.value = ApiKeySetupState(provider = provider)
                 onConnected()
             } catch (canceled: CancellationException) {
                 throw canceled
+            } catch (failure: StageException) {
+                if (current == request) mutableState.value = state.value.copy(
+                    isValidating = false, failure = failure.failure.reason, stageFailure = failure.failure,
+                )
             } catch (failure: ReplyException) {
                 if (current == request) mutableState.value = state.value.copy(
                     isValidating = false, failure = failure.failure,
@@ -127,6 +136,10 @@ internal class DeepSeekKeySetup(
                 )
             }
         }
+    }
+
+    fun reportStorageFailure() {
+        mutableState.value = ApiKeySetupState(isOpen = true, provider = provider, failure = ReplyFailure.Storage)
     }
 
     suspend fun remove() {

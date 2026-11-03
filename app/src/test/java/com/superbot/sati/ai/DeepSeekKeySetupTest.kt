@@ -181,6 +181,53 @@ class DeepSeekKeySetupTest {
     }
 
     @Test
+    fun groqKeyIsSharedWithoutASecondValidationAndDoesNotTouchDeepSeek() = runBlocking {
+        val deepStore = Store("deepseek-key")
+        val groqStore = Store()
+        val deep = DeepSeekKeySetup(this, deepStore, Service()) {}
+        val groq = DeepSeekKeySetup(this, groqStore, Service(), provider = CloudProvider.Groq) {}
+        deep.awaitLoaded()
+        groq.awaitLoaded()
+        groq.open()
+        assertEquals(CloudProvider.Groq, groq.state.value.provider)
+        groq.edit("shared-groq-key")
+        groq.connect()
+        settle(this)
+        repeat(3) { assertEquals("shared-groq-key", groq.key()) }
+        assertEquals(1, groqStore.writes)
+        groq.remove()
+        assertNull(groq.key())
+        assertEquals("deepseek-key", deep.key())
+        assertTrue(deep.status.value.hasKey)
+    }
+
+    @Test
+    fun groqValidationLimitKeepsTheDraftAndDoesNotSaveOrConnect() = runBlocking {
+        val store = Store()
+        var attempts = 0
+        val validator = ApiKeyValidator {
+            attempts++
+            throw StageException(StageFailure(PipelineStage.Chat, CloudProvider.Groq, "models",
+                ReplyFailure.RateLimit, System.currentTimeMillis() + 60_000))
+        }
+        val groq = DeepSeekKeySetup(this, store, validator, provider = CloudProvider.Groq) {
+            error("Must not activate")
+        }
+        groq.awaitLoaded()
+        groq.open()
+        groq.edit("test-key")
+        groq.connect()
+        settle(this)
+        assertEquals(ReplyFailure.RateLimit, groq.state.value.failure)
+        assertEquals("test-key", groq.state.value.draft)
+        groq.connect()
+        settle(this)
+        assertEquals(1, attempts)
+        assertFalse(groq.state.value.isValidating)
+        assertEquals(0, store.writes)
+    }
+
+    @Test
     fun rejectsBlankAndHeaderInjectionAndRedactsDraftFromDiagnostics() = runBlocking {
         val store = Store()
         val setup = DeepSeekKeySetup(this, store, Service()) {}
